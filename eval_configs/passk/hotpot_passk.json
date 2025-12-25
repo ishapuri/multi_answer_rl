@@ -1,0 +1,64 @@
+[
+    {
+      "dataset_name": "mehuldamani/hotpot_qa",
+      "hash_key": "problem",
+      "store_name": "eval_outputs/Hotpot-models/pass_k_evals_onHotpot_nov8",
+      "gpu_memory_utilization": 0.9,
+      "log_path": "results/Hotpot-models/pass_k_evals_onHotpot_nov8"
+    },
+
+    {
+      "name": "Base",
+      "model": "Qwen/Qwen2.5-7B",
+      "check_fn": "confidence_verifier",
+      "sys_prompt_name": "tac",
+      "vllm_task": ["confidence_at_end", "ans_at_end"]
+
+    },
+
+    {
+      "name": "RLVR Single temp 0.0",
+      "model": "/dccstor/ishapuri/new_int_inf/cleanrl/data/qwen3_8b_hotpot_rlvr_single_oldParams/checkpoint-360",
+      "check_fn": "confidence_verifier",
+      "sys_prompt_name": "gen",
+      "vllm_task": ["confidence_at_end", "ans_at_end"],
+      "n": 1,
+      "pass_k_vals": [1, 2, 3],
+      "temperature": 0.0
+    },
+
+    {
+      "name": "RLCR Single temp 0.0",
+      "model": "/dccstor/ishapuri/new_int_inf/cleanrl/data/nov7_rerun_qwen3_8b_hotpot_rlcr_single/checkpoint-360",
+      "check_fn": "confidence_verifier",
+      "sys_prompt_name": "tabc_long",
+      "vllm_task": ["confidence_at_end", "ans_at_end"],
+      "n": 1,
+      "pass_k_vals": [1, 2, 3],
+      "temperature": 0.0
+    },
+
+    {
+        "name": "RLVR Single temp 0.7",
+        "model": "/dccstor/ishapuri/new_int_inf/cleanrl/data/qwen3_8b_hotpot_rlvr_single_oldParams/checkpoint-360",
+        "check_fn": "confidence_verifier",
+        "sys_prompt_name": "gen",
+        "vllm_task": ["confidence_at_end", "ans_at_end"],
+        "n": 3,
+        "pass_k_vals": [1, 2, 3],
+        "temperature": 0.7
+      },
+
+      {
+        "name": "RLCR Single temp 0.7",
+        "model": "/dccstor/ishapuri/new_int_inf/cleanrl/data/nov7_rerun_qwen3_8b_hotpot_rlcr_single/checkpoint-360",
+        "check_fn": "confidence_verifier",
+        "sys_prompt_name": "tabc_long",
+        "vllm_task": ["confidence_at_end", "ans_at_end"],
+        "n": 3,
+        "pass_k_vals": [1, 2, 3],
+        "temperature": 0.7
+      }
+      
+  ]
+  
