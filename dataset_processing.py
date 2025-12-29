@@ -31,14 +31,21 @@ def make_generation_dataset(dataset,sys_prompt):
             user_format = (
                 f"\n\nWRITING PROMPT: {example['prompt']}\n\n"
                 )
-        return {
+        result = {
             "prompt": [
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": user_format},
             ],
         }
+        # Preserve answer/answers field if it exists
+        if "answer" in example:
+            result["answer"] = example["answer"]
+        if "answers" in example:
+            result["answers"] = example["answers"]
+        return result
     
-    dataset = dataset.map(make_generation_conversation)
+    # Use remove_unused_columns=False to preserve all original columns including answer/answers
+    dataset = dataset.map(make_generation_conversation, remove_unused_columns=False)
     return dataset
 
 

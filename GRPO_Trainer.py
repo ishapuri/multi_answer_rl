@@ -28,8 +28,9 @@ import datasets
 import torch
 import torch.utils.data
 import gc 
+import logging
 import transformers
-from accelerate import logging
+from accelerate import logging as accelerate_logging
 from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from datasets import Dataset, IterableDataset
 from torch import nn
@@ -84,6 +85,8 @@ if is_vllm_available():
 
 if is_wandb_available():
     import wandb
+
+logger = logging.getLogger(__name__)
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
@@ -451,6 +454,7 @@ class GRPOTrainer(BaseTrainer):
             "step": deque(maxlen=50000),
             "prompt": deque(maxlen=50000),
             "completion": deque(maxlen=50000),
+            "answer": deque(maxlen=50000),
             "rewards": defaultdict(lambda: deque(maxlen=50000)),
             "advantages": deque(maxlen=50000),
         }
@@ -853,6 +857,15 @@ class GRPOTrainer(BaseTrainer):
         
         return inputs
 
+    def _set_signature_columns_if_needed(self):
+        # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
+        # By default, this method sets `self._signature_columns` to the model's expected inputs.
+        # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
+        # Instead, we set them to the columns expected by the `training_step` method, hence the override.
+        # We also include "answer" and "answers" to preserve them through the data pipeline.
+        if self._signature_columns is None:
+            self._signature_columns = ["prompt", "image", "images", "answer", "answers"]
+
     @profiling_decorator
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
         device = self.accelerator.device
@@ -1249,8 +1262,54 @@ class GRPOTrainer(BaseTrainer):
 
         num_completions_to_log = self.args.num_completions_to_log 
         self._logs["step"].extend([str(self.state.global_step)] * num_completions_to_log)
-        self._logs["prompt"].extend(gather_object(prompts_text)[0:num_completions_to_log])
-        self._logs["completion"].extend(gather_object(completions_text)[0:num_completions_to_log])
+        prompts_gathered = gather_object(prompts_text)[0:num_completions_to_log]
+        completions_gathered = gather_object(completions_text)[0:num_completions_to_log]
+        self._logs["prompt"].extend(prompts_gathered)
+        self._logs["completion"].extend(completions_gathered)
+        
+        # Extract answers from inputs if available
+        # inputs is a list of dicts at this point
+        # Debug: Check what keys are available in inputs (only log once per training run)
+        if len(self._logs["answer"]) == 0 and len(inputs) > 0 and self.accelerator.is_main_process:
+            available_keys = list(inputs[0].keys())
+            print(f"[DEBUG] Available keys in inputs[0]: {available_keys}")
+            if "answer" in available_keys:
+                print(f"[DEBUG] Found 'answer' field, sample value: {inputs[0]['answer']}")
+            elif "answers" in available_keys:
+                print(f"[DEBUG] Found 'answers' field, sample value: {inputs[0]['answers']}")
+            else:
+                print(f"[DEBUG] WARNING: Neither 'answer' nor 'answers' field found in inputs!")
+        
+        # Extract answers from the inputs list and expand to match completions
+        answers_expanded = []
+        for input_item in inputs:
+            answer_str = ""
+            if "answer" in input_item:
+                answer_val = input_item["answer"]
+                if answer_val is None:
+                    answer_str = ""
+                elif isinstance(answer_val, list):
+                    answer_str = str(answer_val)
+                else:
+                    answer_str = str(answer_val)
+            elif "answers" in input_item:
+                answer_val = input_item["answers"]
+                if answer_val is None:
+                    answer_str = ""
+                elif isinstance(answer_val, list):
+                    answer_str = str(answer_val)
+                else:
+                    answer_str = str(answer_val)
+            # Repeat answer for each generation
+            answers_expanded.extend([answer_str] * self.num_generations)
+        
+        # Gather across processes and slice to match logged completions
+        answers_gathered = gather_object(answers_expanded)[0:num_completions_to_log]
+        # Ensure answers list has the same length as prompts/completions
+        while len(answers_gathered) < len(prompts_gathered):
+            answers_gathered.append("")
+        self._logs["answer"].extend(answers_gathered[:len(prompts_gathered)])
+        
         for i, name in enumerate(self.reward_func_names):
             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist()[0:num_completions_to_log])
         self._logs["advantages"].extend(all_process_advantages.tolist()[0:num_completions_to_log])
@@ -1289,6 +1348,17 @@ class GRPOTrainer(BaseTrainer):
                 nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
             )
 
+        # Expand answers to match the number of completions (each input generates num_generations completions)
+        answers_expanded_for_output = []
+        for i, input_item in enumerate(inputs):
+            answer_val = None
+            if "answer" in input_item:
+                answer_val = input_item["answer"]
+            elif "answers" in input_item:
+                answer_val = input_item["answers"]
+            # Repeat answer for each generation
+            answers_expanded_for_output.extend([answer_val] * self.num_generations)
+        
         output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -1296,6 +1366,7 @@ class GRPOTrainer(BaseTrainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
+            "answer": answers_expanded_for_output,  # Preserve answer field through processing
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
@@ -1480,11 +1551,12 @@ class GRPOTrainer(BaseTrainer):
                 import pandas as pd
 
                 table = {
-                    "step": self._logs["step"],
-                    "prompt": self._logs["prompt"],
-                    "completion": self._logs["completion"],
-                    **self._logs["rewards"],
-                    "advantage": self._logs["advantages"],
+                    "step": list(self._logs["step"]),
+                    "prompt": list(self._logs["prompt"]),
+                    "completion": list(self._logs["completion"]),
+                    "answer": list(self._logs["answer"]),
+                    **{name: list(values) for name, values in self._logs["rewards"].items()},
+                    "advantage": list(self._logs["advantages"]),
                 }
                 df = pd.DataFrame(table)
                 if self.wandb_log_unique_prompts:

@@ -512,7 +512,7 @@ def _is_correct(cand: str, gold, source=None) -> bool:
     
     try:
         for g in gold_list:
-            if source is not None and (source[0] == 'hotpotQA' or source[0] == 'ambigQA'):
+            if source is not None and (source[0] == 'hotpotQA' or source[0] == 'ambigQA' or source[0] == 'medDataset'):
                 if exact_match_score(cand, g):
                        #print("exact_match_score is true, cand, gold", cand, gold)
                        return True

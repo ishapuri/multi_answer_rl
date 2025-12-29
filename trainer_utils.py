@@ -147,6 +147,7 @@ def split_tensor_dict(
 ) -> list[dict[str, Optional[torch.Tensor]]]:
     """
     Splits a dictionary of tensors along the first dimension into `num_chunks` equal parts.
+    Also handles lists and other sequence types.
 
     Example:
     ```python
@@ -161,16 +162,35 @@ def split_tensor_dict(
     ]
     ```
     """
-    first_tensor = next(tensor for tensor in tensor_dict.values() if tensor is not None)
-    chunk_size = first_tensor.shape[0] // num_chunks
+    # Find first non-None value to determine batch size (handle both tensors and lists)
+    first_val = next(val for val in tensor_dict.values() if val is not None)
+    if isinstance(first_val, torch.Tensor):
+        batch_size = first_val.shape[0]
+    elif isinstance(first_val, (list, tuple)):
+        batch_size = len(first_val)
+    else:
+        # Fallback: try to get length
+        batch_size = len(first_val) if hasattr(first_val, '__len__') else 1
+    
+    chunk_size = batch_size // num_chunks
     chunks = []
     for i in range(num_chunks):
         chunk_dict = {}
         for key, tensor in tensor_dict.items():
-            if tensor is not None and (isinstance(tensor, list) or tensor.ndim > 0):
-                chunk_dict[key] = tensor[i * chunk_size : (i + 1) * chunk_size]
-            elif tensor is not None and tensor.ndim == 0:
-                chunk_dict[key] = tensor
+            if tensor is not None:
+                if isinstance(tensor, list):
+                    chunk_dict[key] = tensor[i * chunk_size : (i + 1) * chunk_size]
+                elif isinstance(tensor, torch.Tensor) and tensor.ndim > 0:
+                    chunk_dict[key] = tensor[i * chunk_size : (i + 1) * chunk_size]
+                elif isinstance(tensor, torch.Tensor) and tensor.ndim == 0:
+                    chunk_dict[key] = tensor
+                else:
+                    # For other sequence types, try to slice
+                    try:
+                        chunk_dict[key] = tensor[i * chunk_size : (i + 1) * chunk_size]
+                    except (TypeError, AttributeError):
+                        # If slicing fails, just copy the value
+                        chunk_dict[key] = tensor
             else:
                 chunk_dict[key] = None
         chunks.append(chunk_dict)
