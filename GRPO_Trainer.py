@@ -857,15 +857,6 @@ class GRPOTrainer(BaseTrainer):
         
         return inputs
 
-    def _set_signature_columns_if_needed(self):
-        # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
-        # By default, this method sets `self._signature_columns` to the model's expected inputs.
-        # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
-        # Instead, we set them to the columns expected by the `training_step` method, hence the override.
-        # We also include "answer" and "answers" to preserve them through the data pipeline.
-        if self._signature_columns is None:
-            self._signature_columns = ["prompt", "image", "images", "answer", "answers"]
-
     @profiling_decorator
     def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
         device = self.accelerator.device
@@ -1268,35 +1259,21 @@ class GRPOTrainer(BaseTrainer):
         self._logs["completion"].extend(completions_gathered)
         
         # Extract answers from inputs if available
-        # inputs is a list of dicts at this point
-        # Debug: Check what keys are available in inputs (only log once per training run)
-        if len(self._logs["answer"]) == 0 and len(inputs) > 0 and self.accelerator.is_main_process:
-            available_keys = list(inputs[0].keys())
-            print(f"[DEBUG] Available keys in inputs[0]: {available_keys}")
-            if "answer" in available_keys:
-                print(f"[DEBUG] Found 'answer' field, sample value: {inputs[0]['answer']}")
-            elif "answers" in available_keys:
-                print(f"[DEBUG] Found 'answers' field, sample value: {inputs[0]['answers']}")
-            else:
-                print(f"[DEBUG] WARNING: Neither 'answer' nor 'answers' field found in inputs!")
-        
-        # Extract answers from the inputs list and expand to match completions
+        # Each input corresponds to one prompt, which generates num_generations completions
+        # So we need to expand answers to match the completions
         answers_expanded = []
         for input_item in inputs:
+            # Try "answer" first, then "answers", handle both string and list formats
             answer_str = ""
             if "answer" in input_item:
                 answer_val = input_item["answer"]
-                if answer_val is None:
-                    answer_str = ""
-                elif isinstance(answer_val, list):
+                if isinstance(answer_val, list):
                     answer_str = str(answer_val)
                 else:
                     answer_str = str(answer_val)
             elif "answers" in input_item:
                 answer_val = input_item["answers"]
-                if answer_val is None:
-                    answer_str = ""
-                elif isinstance(answer_val, list):
+                if isinstance(answer_val, list):
                     answer_str = str(answer_val)
                 else:
                     answer_str = str(answer_val)
@@ -1348,17 +1325,6 @@ class GRPOTrainer(BaseTrainer):
                 nanmax(self.accelerator.gather(max_importance_sampling_ratio)).item()
             )
 
-        # Expand answers to match the number of completions (each input generates num_generations completions)
-        answers_expanded_for_output = []
-        for i, input_item in enumerate(inputs):
-            answer_val = None
-            if "answer" in input_item:
-                answer_val = input_item["answer"]
-            elif "answers" in input_item:
-                answer_val = input_item["answers"]
-            # Repeat answer for each generation
-            answers_expanded_for_output.extend([answer_val] * self.num_generations)
-        
         output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -1366,7 +1332,6 @@ class GRPOTrainer(BaseTrainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
             "num_items_in_batch": num_items_in_batch,
-            "answer": answers_expanded_for_output,  # Preserve answer field through processing
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps

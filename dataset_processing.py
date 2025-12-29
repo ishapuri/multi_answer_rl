@@ -44,8 +44,16 @@ def make_generation_dataset(dataset,sys_prompt):
             result["answers"] = example["answers"]
         return result
     
-    # Use remove_unused_columns=False to preserve all original columns including answer/answers
-    dataset = dataset.map(make_generation_conversation, remove_unused_columns=False)
+    # For DatasetDict, we need to map over each split individually
+    # The mapping function preserves answer/answers fields, so columns are preserved by default
+    if hasattr(dataset, 'keys'):  # It's a DatasetDict
+        from datasets import DatasetDict
+        mapped_splits = {}
+        for split_name in dataset.keys():
+            mapped_splits[split_name] = dataset[split_name].map(make_generation_conversation)
+        dataset = DatasetDict(mapped_splits)
+    else:  # It's a single Dataset
+        dataset = dataset.map(make_generation_conversation)
     return dataset
 
 

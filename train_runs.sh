@@ -9,7 +9,7 @@ wandb online
 
 export WANDB_API_KEY=9799045b86877577494db6f0b896bc7b0e8a1f85
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch --num_processes 6 --config_file deepspeed.yaml rl_runner.py --config configs/Qwen-3-8B/medical/qwen3_8b_medical_rlcr_multiple.yaml
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 accelerate launch --num_processes 6 --config_file deepspeed.yaml rl_runner.py --config configs/Qwen-3-8B/medical/qwen3_8b_medical_rlvr_single.yaml
 
 
 ## The generation batch size = num_processes * per_device_train_batch_size * gradient_accumulation_steps

@@ -512,17 +512,38 @@ def _is_correct(cand: str, gold, source=None) -> bool:
     
     try:
         for g in gold_list:
-            if source is not None and (source[0] == 'hotpotQA' or source[0] == 'ambigQA' or source[0] == 'medDataset'):
-                if exact_match_score(cand, g):
-                       #print("exact_match_score is true, cand, gold", cand, gold)
-                       return True
+            # Check if this is a math problem that requires verification
+            # Use math verification only for explicitly math-related sources
+            use_math_verification = False
+            if source is not None and len(source) > 0:
+                source_name = source[0] if isinstance(source, (list, tuple)) else source
+                # Only use math verification for math datasets (not for text-based like medical, QA, etc.)
+                use_math_verification = 'math' in str(source_name).lower() and source_name not in ['hotpotQA', 'ambigQA', 'medDataset']
+            
+            if use_math_verification:
+                # Try math verification for math problems
+                try:
+                    if verify(g, parse(cand)):
+                        return True
+                except Exception:
+                    # If math verification fails, fall back to text matching
+                    if exact_match_score(cand, g):
+                        return True
             else:
-                if verify(g, parse(cand)):
+                # Default to text matching for all text-based answers (medical, QA, etc.)
+                if exact_match_score(cand, g):
                     return True
     
         #print("no match found, return false, cand, gold", cand, gold)
         return False
     except Exception:
+        # Fallback: try exact_match_score if everything else fails
+        try:
+            for g in gold_list:
+                if exact_match_score(cand, g):
+                    return True
+        except Exception:
+            pass
         #print("exception in _is_correct, return false, cand, gold", cand, gold)
         return False
 
