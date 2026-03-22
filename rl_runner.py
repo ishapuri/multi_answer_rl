@@ -8,7 +8,7 @@ from datasets import load_dataset
 import sys
 import os 
 from transformers.trainer_utils import get_last_checkpoint
-from reward_fns import format_reward, accuracy_reward, brier_reward, mean_confidence_reward, confidence_one_or_zero, response_constraint_reward, combined_format_and_constraint_reward, pass_at_1, pass_at_i
+from reward_fns import format_reward, accuracy_reward, brier_reward, mean_confidence_reward, confidence_one_or_zero, response_constraint_reward, combined_format_and_constraint_reward, pass_at_1, pass_at_i, uniqueness_reward, entropy_reward
 from system_prompts import get_sys_prompt
 from dataset_processing import process_dataset 
 from GRPO_Trainer import GRPOTrainer
@@ -67,7 +67,7 @@ def main(script_args, training_args, model_args):
 
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
-     # Get reward functions
+    # Build reward function registry
     REWARD_FUNCS_REGISTRY = {
         "format": partial(
             format_reward,
@@ -106,7 +106,16 @@ def main(script_args, training_args, model_args):
             format_pattern=script_args.format_pattern,
             num_candidates=getattr(script_args, "num_candidates", None),
         ),
-
+        "uniqueness": partial(
+            uniqueness_reward,
+            format_pattern=script_args.format_pattern,
+            num_candidates=getattr(script_args, "num_candidates", None),
+        ),
+        "entropy": partial(
+            entropy_reward,
+            format_pattern=script_args.format_pattern,
+            num_candidates=getattr(script_args, "num_candidates", None),
+        ),
 
 
     }
@@ -129,7 +138,7 @@ def main(script_args, training_args, model_args):
 
     eval_dataset = eval_dataset.select(range(script_args.eval_sample_size))
         
-    training_args.num_candidates = script_args.num_candidates #isha added
+    training_args.num_candidates = script_args.num_candidates
 
     #############################
     # Initialize the GRPO trainer
@@ -141,7 +150,7 @@ def main(script_args, training_args, model_args):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset if training_args.eval_strategy != "no" else None)
 
-     ###############
+    ###############
     # Training loop
     ###############
     logger.info("*** Train ***")
@@ -152,15 +161,7 @@ def main(script_args, training_args, model_args):
         checkpoint = last_checkpoint
 
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    metrics = train_result.metrics
-    metrics["train_samples"] = script_args.train_subset_size
-    # trainer.log_metrics("train", metrics)
-    # trainer.save_metrics("train", metrics)
-    try:
-        trainer.save_state()
-    except:
-        print("Failed to save state, please debug")
-        pass
+    trainer.save_state()
 
     ##################################
     # Save model and create model card

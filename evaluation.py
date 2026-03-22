@@ -3,7 +3,7 @@ from datasets import load_dataset
 import copy
 from dataset_processing import process_dataset
 from vllm import LLM, SamplingParams
-from transformers import  AutoTokenizer, AutoModelForSequenceClassification
+from transformers import  AutoTokenizer, AutoModelForSequenceClassification, AutoConfig
 from eval.eval_utils import hash_dataset
 from eval.eval_args import GlobalArgs, LocalConfig
 from eval.check_functions import confidence_verifier, llm_confidence_verifier 
@@ -66,15 +66,50 @@ def main(global_args,local_configs):
 
         ##### GENERATION #####
         
-
-        tokenizer = AutoTokenizer.from_pretrained(config.model, trust_remote_code=True)
+        # Handle tokenizer loading: if config.model is a local checkpoint path,
+        # try to load tokenizer from there first, but if tokenizer files don't exist,
+        # fall back to the base model from the checkpoint's config.json
+        model_path = config.model
+        if os.path.isdir(model_path):
+            # Check if tokenizer files exist in the checkpoint
+            tokenizer_files = ['tokenizer_config.json', 'tokenizer.json', 'vocab.json', 'merges.txt', 'vocab.txt']
+            has_tokenizer = any(os.path.exists(os.path.join(model_path, f)) for f in tokenizer_files)
+            
+            if not has_tokenizer:
+                # Try to get base model from checkpoint's config.json
+                try:
+                    config_path = os.path.join(model_path, 'config.json')
+                    if os.path.exists(config_path):
+                        with open(config_path, 'r') as f:
+                            model_config = json.load(f)
+                        # Try common keys for base model name
+                        base_model = model_config.get('_name_or_path') or model_config.get('model_type')
+                        if base_model and not os.path.isdir(base_model):
+                            # If it looks like a HuggingFace repo ID, use it
+                            if '/' in base_model or base_model.startswith('Qwen') or 'qwen' in base_model.lower():
+                                print(f"Loading tokenizer from base model: {base_model}")
+                                tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+                            else:
+                                # Fall back to trying the checkpoint path
+                                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                        else:
+                            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                    else:
+                        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                except Exception as e:
+                    print(f"Warning: Could not load tokenizer from base model, trying checkpoint path: {e}")
+                    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            else:
+                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        else:
+            # Not a local path, assume it's a HuggingFace repo ID
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         to_tokenize = [ local_dataset[i][config.tokenize_key] for i in range(len(local_dataset))]
         prompt_ids = tokenizer.apply_chat_template(to_tokenize,add_generation_prompt=True)
         texts = [tokenizer.decode(x) for x in prompt_ids]
 
 
-        print("Prompt samples for config: ", name)
-        print(tokenizer.decode(prompt_ids[0]))
+        print(f"Prompt sample for config '{name}':\n{tokenizer.decode(prompt_ids[0])}")
 
         sampling_params= SamplingParams(n = config.n, temperature = config.temperature, max_tokens=config.max_tokens, seed=config.seed,logprobs=1) 
         llm = LLM(model=config.model,gpu_memory_utilization=global_args.gpu_memory_utilization)
@@ -128,9 +163,7 @@ def main(global_args,local_configs):
 
             #now append the generated text to the original prompt
             texts = [f"\n\nPROBLEM: {local_dataset[i][ques_key]}\n\nEND OF PROBLEM\n\nMODEL'S RESPONSE: {output.outputs[0].text}\n\nEND OF RESPONSE\n\n" for i, output in enumerate(outputs)]
-            print("Gen and Classify Samples for config: ", name)
-            print(texts[0])
-            print(texts[1])
+            print(f"Gen-then-classify sample for config '{name}':\n{texts[0]}")
             class_outputs = [] 
             if config.use_hf:
                 llm = AutoModelForSequenceClassification.from_pretrained(config.class_model).to("cuda")

@@ -1,16 +1,16 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen3-14B
-run_name: "qwen3_14b_ambigQA_rlcr_multiple_ambigQASpecificPrompt"
-output_dir: data/qwen3_14b_ambigQA_rlcr_multiple_ambigQASpecificPrompt
+model_name_or_path: Qwen/Qwen3-8B
+run_name: "rlvr_multi_rlvrPromptOriginal"
+output_dir: data/from_rlvr_prompt_to_rlcr_prompt/qwen3_8b_medical_rlvr_multi
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 
 # Data training arguments
-dataset_name: mehuldamani/ambigQA
+dataset_name: mehuldamani/medDataset_25k
 
 # GRPO trainer config
-format_pattern: "multi_answer"
+format_pattern: "multi_answer_rlvr"
 gradient_accumulation_steps: 32
 hub_strategy: "end"
 learning_rate: 1e-06
@@ -20,23 +20,26 @@ max_steps: -1
 num_generations: 32
 num_train_epochs: 1
 per_device_eval_batch_size: 32
-per_device_train_batch_size: 4
+per_device_train_batch_size: 6
 num_candidates: 3
 push_to_hub: true
-reward_funcs: ["combined_format_and_constraint","accuracy","brier", "mean_confidence","confidence_one_or_zero","pass_at_1","pass_at_3"]
-reward_weights: [0.5,0.5,0.5,0.00001,0.00001,0.00001,0.00001]
+reward_funcs: ["format","accuracy"]
+reward_weights: [0.5,0.5]
 seed: 43
-sys_prompt_name: "multi_answer_short_ambigqa"
+sys_prompt_name: "multi_answer_rlvr_medical"
 temperature: 0.7 
-vllm_gpu_memory_utilization: 0.7
+vllm_gpu_memory_utilization: 0.4
 vllm_importance_sampling_correction: false
 warmup_ratio: 0.05
 
+# accuracy_via_judge: true  # Set to true to use Qwen3 8B as judge for accuracy evaluation
+# judge_gpu_id: 0  # GPU ID to run the judge model on (if None, uses default GPU)
 
 
-#Not USEFUL
+
+# Logging and checkpointing
 eval_strategy: "steps" 
-eval_steps: 50
+eval_steps: 100
 eval_on_start: false
 log_completions: true
 log_level: info
@@ -44,8 +47,9 @@ logging_steps: 1
 logging_strategy: steps
 overwrite_output_dir: true
 save_strategy: "steps"
-save_steps: 60
+save_steps: 20
 save_total_limit: 1
 report_to:
 - wandb
 use_vllm: true
+

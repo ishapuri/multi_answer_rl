@@ -202,6 +202,25 @@ class GRPOConfig(trl.GRPOConfig):
             "improving training speed."
         },
     )
+    target_kl: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Target KL divergence for adaptive beta control. If set, beta will be adjusted automatically to maintain this target KL. "
+            "Recommended value: 0.04. When set, beta is updated based on the current KL divergence."
+        },
+    )
+    adaptive_beta: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use adaptive beta control. If True and target_kl is set, beta will be adjusted automatically to maintain target_kl."
+        },
+    )
+    adaptive_beta_lr: float = field(
+        default=0.1,
+        metadata={
+            "help": "Learning rate for adaptive beta updates. Controls how quickly beta adjusts to maintain target_kl. Default: 0.1"
+        },
+    )
     num_iterations: int = field(
         default=1,
         metadata={"help": "Number of iterations per batch (denoted as μ in the algorithm)."},
@@ -371,14 +390,57 @@ class GRPOConfig(trl.GRPOConfig):
     )
 
     wandb_project: Optional[str] = field(
-        default="internalized_inf_scaling",
-        metadata={"help": ("The project to store runs under.")},
+        default=None,
+        metadata={"help": "The wandb project to log runs under. Set via WANDB_PROJECT env var or this field."},
     )
 
 
     reward_model: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the reward model."},
+    )
+
+    # Adaptive brier weight parameters
+    enable_adaptive_brier: bool = field(
+        default=False,
+        metadata={"help": "Whether to enable adaptive brier weight scheduling. If False, uses the static weight from reward_weights."},
+    )
+    adaptive_brier_weight_start: float = field(
+        default=0.0,
+        metadata={"help": "Starting weight for adaptive brier reward. Used for steps before ramp_start_step."},
+    )
+    adaptive_brier_weight_end: float = field(
+        default=0.05,
+        metadata={"help": "Ending weight for adaptive brier reward. Reached by the end of training."},
+    )
+    adaptive_brier_ramp_start_step: int = field(
+        default=200,
+        metadata={"help": "Training step at which the brier weight starts ramping from start to end weight."},
+    )
+    
+    more_than_one_correctness_point: bool = field(
+        default=False,
+        metadata={"help": "If True, count uniquely correct answers (one point per unique correct answer) instead of binary correctness."},
+    )
+    
+    enforce_uniqueness: Optional[bool] = field(
+        default=None,
+        metadata={"help": "If True, enforces answer uniqueness via response_constraint_reward in accuracy_reward. If False, skips uniqueness checking. If None (default), uses format-dependent behavior: True for 'multi_answer' format, False otherwise."},
+    )
+    
+    confidences_sum_to_less_than_1: bool = field(
+        default=True,
+        metadata={"help": "If True (default), requires that confidences sum to <= 1 in response_constraint_reward. If False, removes this requirement."},
+    )
+    
+    # Entropy reward decay parameters
+    entropy_decay_start_step: int = field(
+        default=200,
+        metadata={"help": "Training step at which the entropy reward decay begins. Before this step, entropy reward is at full strength."},
+    )
+    entropy_decay_final_factor: float = field(
+        default=0.0,
+        metadata={"help": "Final multiplier for entropy reward at max_steps. The entropy reward decays linearly from 1.0 at decay_start_step to this value at max_steps. Set to 0.0 to decay to zero, or a value like 0.2 to maintain some exploration signal."},
     )
 
 

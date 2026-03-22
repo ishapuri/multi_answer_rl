@@ -1,365 +1,308 @@
 import math
 import re
-from math_verify import verify,parse
-import numpy as np 
 import string
+import warnings
+
+import numpy as np
+from math_verify import verify, parse
+
+try:
+    import torch
+    import torch.nn.functional as F
+except ImportError:
+    torch = None
+    F = None
+
+
+# ---------------------------------------------------------------------------
+# Text normalization
+# ---------------------------------------------------------------------------
 
 def normalize_answer(s):
+    """Lowercase, remove punctuation/articles, and collapse whitespace."""
+    s = s.lower()
+    s = ''.join(ch for ch in s if ch not in set(string.punctuation))
+    s = re.sub(r'\b(a|an|the)\b', ' ', s)
+    return ' '.join(s.split())
 
-    def remove_articles(text):
-        return re.sub(r'\b(a|an|the)\b', ' ', text)
-
-    def white_space_fix(text):
-        return ' '.join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return ''.join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
 
 def exact_match_score(prediction, ground_truth):
-    return (normalize_answer(prediction) == normalize_answer(ground_truth))
+    return normalize_answer(prediction) == normalize_answer(ground_truth)
 
 
 def _safe_float(x):
+    """Convert x to float, returning None if invalid or non-finite."""
     try:
         v = float(x)
-        if not np.isfinite(v):
-            return None
-        return v
+        return v if np.isfinite(v) else None
     except Exception:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Tag extraction helpers
+# ---------------------------------------------------------------------------
 
-def check_content_has_required_tags(content: str, K: int, checkConfidences: bool = True) -> bool:
-    if "<think>" not in content or "</think" not in content:
-        #print("in check_content_has_required_tags, f<think> or f</think> not in content")
-        return False
-
-    if K == 1: 
-        if checkConfidences:
-            if (f"<answer>" not in content or f"</answer>" not in content or
-                f"<confidence>" not in content or f"</confidence>" not in content or f"<analysis>" not in content or f"</analysis>" not in content):
-                return False
-        else:
-            if (f"<answer>" not in content or f"</answer>" not in content):
-                #print("in check_content_has_required_tags, f<answer> or f</answer> not in content")
-                return False
-    else: 
-        for i in range(1, K + 1):
-            if checkConfidences:
-                if (f"<answer{i}>" not in content or f"</answer{i}>" not in content or
-                    f"<confidence{i}>" not in content or f"</confidence{i}>" not in content or f"<analysis>" not in content or f"</analysis>" not in content):
-                    return False
-            else:
-                if (f"<answer{i}>" not in content or f"</answer{i}>" not in content):
-                    return False
-    return True
+def _extract_between(content: str, open_tag: str, close_tag: str, start: int = 0):
+    """
+    Return (text, end_pos) for the first open_tag...close_tag after `start`.
+    Returns (None, -1) if not found.
+    end_pos points to right after close_tag, suitable as the next search start.
+    """
+    s = content.find(open_tag, start)
+    if s == -1:
+        return None, -1
+    s += len(open_tag)
+    e = content.find(close_tag, s)
+    if e == -1:
+        return None, -1
+    return content[s:e].strip(), e + len(close_tag)
 
 
-
+def _extract_last_between(content: str, open_tag: str, close_tag: str) -> str:
+    """Return the last occurrence of text between open_tag and close_tag."""
+    last, pos = "", 0
+    while True:
+        text, pos = _extract_between(content, open_tag, close_tag, pos)
+        if text is None:
+            break
+        last = text
+    return last
 
 
 def _extract_single_candidate(content: str):
     """
-    Extracts a single answer and confidence using <answer>...</answer>
-    and <confidence>...</confidence>.
-    Returns (answers, confidences) or (None, None) on failure.
+    Extract a single answer and confidence from <answer>...</answer> and
+    <confidence>...</confidence> tags. Returns ([answer], [conf]) or (None, None).
     """
-    answer_open, answer_close = "<answer>", "</answer>"
-    conf_open, conf_close = "<confidence>", "</confidence>"
-
-    answer_start = content.find(answer_open)
-    if answer_start == -1:
+    ans, pos = _extract_between(content, "<answer>", "</answer>")
+    if ans is None:
         return None, None
-    answer_start += len(answer_open)
-
-    answer_end = content.find(answer_close, answer_start)
-    if answer_end == -1:
+    conf, _ = _extract_between(content, "<confidence>", "</confidence>", pos)
+    if conf is None:
         return None, None
-    ans = content[answer_start:answer_end].strip()
-
-    conf_start = content.find(conf_open, answer_end + len(answer_close))
-    if conf_start == -1:
-        return None, None
-    conf_start += len(conf_open)
-
-    conf_end = content.find(conf_close, conf_start)
-    if conf_end == -1:
-        return None, None
-    conf = content[conf_start:conf_end].strip()
-
     return [ans], [conf]
-
 
 
 def _extract_flat_candidates(content: str, K: int):
     """
-    makes sure the ordering is right: <answer1>... </answer1> then <confidence1>...</confidence1>, blah blah blah
-    returns (answers, confidences) or (None, None) on failure
+    Extract K (answer, confidence) pairs. Supports two layouts:
+    - Interleaved: <answer1>A</answer1><confidence1>p</confidence1>...
+    - Split: all <answerI> tags first, then all <confidenceI> tags
+      (with optional <analysis> in between, as in the medical RLCR format).
+    Returns (answers, confidences) or (None, None).
     """
-    answers = []
-    confidences = []
-    idx = 0
-    
+    # Try interleaved layout first
+    answers, confs, pos = [], [], 0
     for i in range(1, K + 1):
-        answer_open, answer_close = f"<answer{i}>", f"</answer{i}>"
-        conf_open, conf_close = f"<confidence{i}>", f"</confidence{i}>"
-
-        answer_start = content.find(answer_open, idx)
-        if answer_start == -1: 
-            return None, None
-        answer_start += len(answer_open)
-        
-        answer_end = content.find(answer_close, answer_start)
-        if answer_end == -1: 
-            return None, None
-        ans = content[answer_start:answer_end].strip()
-
-        conf_start = content.find(conf_open, answer_end + len(answer_close))
-        if conf_start == -1: 
-            return None, None
-            
-        conf_start += len(conf_open)
-        
-        conf_end = content.find(conf_close, conf_start)
-        
-        if conf_end == -1: 
-            return None, None
-            
-        conf = content[conf_start:conf_end].strip()
-
+        ans, pos = _extract_between(content, f"<answer{i}>", f"</answer{i}>", pos)
+        if ans is None:
+            break
+        conf, pos = _extract_between(content, f"<confidence{i}>", f"</confidence{i}>", pos)
+        if conf is None:
+            break
         answers.append(ans)
-        confidences.append(conf)
-        
-        idx = conf_end + len(conf_close)
+        confs.append(conf)
 
-    return answers, confidences
+    if len(answers) == K:
+        return answers, confs
 
+    # Fall back to split layout (all answers first, all confidences after analysis)
+    answers, confs = [], []
+    for i in range(1, K + 1):
+        ans, _ = _extract_between(content, f"<answer{i}>", f"</answer{i}>")
+        if ans is None:
+            return None, None
+        answers.append(ans)
+    for i in range(1, K + 1):
+        conf, _ = _extract_between(content, f"<confidence{i}>", f"</confidence{i}>")
+        if conf is None:
+            return None, None
+        confs.append(conf)
 
+    return (answers, confs) if len(answers) == K else (None, None)
 
-def _extract_last_between(content: str, open_tag: str, close_tag: str) -> str:
-    """find last occurrence of <open_tag> ... </close_tag>"""
-    last = ""
-    idx = 0
-    while True:
-        start = content.find(open_tag, idx)
-
-        if start == -1: 
-            break
-
-        start += len(open_tag)
-        end = content.find(close_tag, start)
-
-        if end == -1: 
-            break
-
-        last = content[start:end].strip()
-        idx = end + len(close_tag)
-    return last
 
 def extract_only_answers_rlvr(content: str, K: int):
     """
-    Extracts answers in order. Supports both:
-      - Numbered tags: <answer1>...</answer1>, <answer2>...</answer2>, etc.
-      - Single tag: <answer>...</answer>
-    Returns a list of answers, or None if parsing fails.
+    Extract K answers from numbered <answer1>...<answerK> tags, or from a
+    single <answer> tag as fallback. Returns a list of strings, or None.
     """
-    answers = []
-    idx = 0
-
-    # Case 1: numbered answers (e.g., <answer1>, <answer2>, ...)
-    numbered_found = False
+    answers, pos = [], 0
     for i in range(1, K + 1):
-        answer_open, answer_close = f"<answer{i}>", f"</answer{i}>"
-
-        answer_start = content.find(answer_open, idx)
-        if answer_start == -1:
-            break  # stop if no more numbered answers
-        numbered_found = True
-        answer_start += len(answer_open)
-
-        answer_end = content.find(answer_close, answer_start)
-        if answer_end == -1:
-            return None
-
-        ans = content[answer_start:answer_end].strip()
+        ans, pos = _extract_between(content, f"<answer{i}>", f"</answer{i}>", pos)
+        if ans is None:
+            break
         answers.append(ans)
 
-        # advance the search index
-        idx = answer_end + len(answer_close)
+    if answers:
+        return answers
 
-    # Case 2: single unnumbered <answer>...</answer>
-    if not numbered_found:
-        answer_open, answer_close = "<answer>", "</answer>"
-        answer_start = content.find(answer_open)
-        if answer_start == -1:
-            return None
-        answer_start += len(answer_open)
-
-        answer_end = content.find(answer_close, answer_start)
-        if answer_end == -1:
-            return None
-
-        ans = content[answer_start:answer_end].strip()
-        answers.append(ans)
-
-    return answers if answers else None
+    # Fallback: single unnumbered <answer> tag
+    ans, _ = _extract_between(content, "<answer>", "</answer>")
+    return [ans] if ans is not None else None
 
 
+# ---------------------------------------------------------------------------
+# Format validation
+# ---------------------------------------------------------------------------
+
+def check_content_has_required_tags(
+    content: str, K: int, checkConfidences: bool = True, format_pattern: str = None
+) -> bool:
+    """
+    Return True iff content contains all required structural tags.
+
+    Checks:
+    - Balanced, non-empty <think>...</think> block.
+    - K answer tags (numbered for K>1, plain for K=1).
+    - K confidence tags when checkConfidences=True.
+    - <analysis> tags when checkConfidences=True, unless format is 'multi_answer_no_analysis'.
+    """
+    # Validate <think>...</think>: must be balanced, ordered, and non-empty
+    opens  = [m.start() for m in re.finditer(r"<think>",  content)]
+    closes = [m.start() for m in re.finditer(r"</think>", content)]
+    if not opens or not closes or len(opens) != len(closes):
+        return False
+    if any(c < o or not content[o + len("<think>"):c].strip() for o, c in zip(opens, closes)):
+        return False
+
+    requires_analysis = (
+        str(format_pattern).lower() != "multi_answer_no_analysis" if format_pattern else True
+    )
+
+    if K == 1:
+        if "<answer>" not in content or "</answer>" not in content:
+            return False
+        if checkConfidences:
+            if "<confidence>" not in content or "</confidence>" not in content:
+                return False
+            if requires_analysis and ("<analysis>" not in content or "</analysis>" not in content):
+                return False
+    else:
+        for i in range(1, K + 1):
+            if f"<answer{i}>" not in content or f"</answer{i}>" not in content:
+                return False
+            if checkConfidences and (
+                f"<confidence{i}>" not in content or f"</confidence{i}>" not in content
+            ):
+                return False
+        if checkConfidences and requires_analysis and (
+            "<analysis>" not in content or "</analysis>" not in content
+        ):
+            return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Format reward
+# ---------------------------------------------------------------------------
 
 def format_reward(format_pattern, completions, num_candidates, **kwargs):
     """
-    Returns a list of {0.0, 1.0}.
-    - 'multi_answer': requires K ordered <answeri>/<confidencei> pairs and numeric confidences in [0,1].
-      Also requires <think> and </analysis> to be present.
-    - 'ta'/'tac'/'tabc'/'tbac': light presence + (for *c*) numeric confidence in [0,1].
+    Returns 1.0 if the completion matches the expected structural format, else 0.0.
+
+    Supported format_pattern values:
+    - 'multi_answer'             : K candidates with confidences + <analysis>
+    - 'multi_answer_no_analysis' : K candidates with confidences, no <analysis>
+    - 'multi_answer_rlvr'        : K candidates without confidences
+    - 'rlcr_single_answer'       : 1 candidate with confidence
+    - 'rlvr_single_answer'       : 1 candidate without confidence
+    - 'ta' / 'tac' / 'tabc' / 'tbac': legacy single-answer formats
     """
-    completion_contents = [c[0]["content"] for c in completions]
-    out = []
     fmt = str(format_pattern).lower()
+    K   = num_candidates
+    contents = [c[0]["content"] for c in completions]
 
-    if fmt == "rlcr_single_answer": #k should be 1
-
-        K = num_candidates #kwargs.get("k_expected", kwargs.get("num_candidates"))
-
+    if fmt in ("multi_answer", "multi_answer_no_analysis"):
         if not isinstance(K, int) or K <= 0:
-            return [0.0 for _ in completions]
-
-        for content in completion_contents:
-            if not check_content_has_required_tags(content, K, checkConfidences=True):
+            return [0.0] * len(completions)
+        out = []
+        for content in contents:
+            if not check_content_has_required_tags(content, K, checkConfidences=True, format_pattern=fmt):
                 out.append(0.0); continue
-
-
-            answers, confs = _extract_single_candidate(content)
-            
-            if answers is None:
-                out.append(0.0); continue
-            vals = [_safe_float(c) for c in confs]
-            ok = all(v is not None and 0.0 <= v <= 1.0 for v in vals)
-            out.append(1.0 if ok else 0.0)
-           
-        return out
-
-    elif fmt == "rlvr_single_answer": #k should be 1
-
-        K = num_candidates #kwargs.get("k_expected", kwargs.get("num_candidates"))
-        #print("K", K)
-
-        if not isinstance(K, int) or K <= 0:
-            return [0.0 for _ in completions]
-
-        for content in completion_contents:
-            if not check_content_has_required_tags(content, K, checkConfidences=False):
-                #print("appending 0.0 because not check_content_has_required_tags")
-                out.append(0.0); continue
-
-
-            answers, confs = extract_only_answers_rlvr(content, K), None
-            
-            if answers is None:
-                #print("appending 0.0 because answers is None")
-                out.append(0.0); continue
-            
-            out.append(1.0)
-           
-        return out
-
-    elif fmt == "multi_answer":
-        K = num_candidates #kwargs.get("k_expected", kwargs.get("num_candidates"))
-        if not isinstance(K, int) or K <= 0:
-            return [0.0 for _ in completions]
-
-        for content in completion_contents:
-            #make sure tags are there
-            if not check_content_has_required_tags(content, K, checkConfidences=True):
-                out.append(0.0); continue
-            
-            #extract answers and confidences 
             answers, confs = _extract_flat_candidates(content, K)
             if answers is None:
                 out.append(0.0); continue
-            
             vals = [_safe_float(c) for c in confs]
-            ok = all(v is not None and 0.0 <= v <= 1.0 for v in vals)
-            out.append(1.0 if ok else 0.0)
+            out.append(1.0 if all(v is not None and 0.0 <= v <= 1.0 for v in vals) else 0.0)
         return out
 
-    
-    elif fmt == "multi_answer_rlvr":
-        K = num_candidates #kwargs.get("k_expected", kwargs.get("num_candidates"))
+    if fmt == "multi_answer_rlvr":
         if not isinstance(K, int) or K <= 0:
-            return [0.0 for _ in completions]
-        
-        for content in completion_contents:
-            if not check_content_has_required_tags(content, K, checkConfidences=False):
+            return [0.0] * len(completions)
+        out = []
+        for content in contents:
+            if not check_content_has_required_tags(content, K, checkConfidences=False, format_pattern=fmt):
                 out.append(0.0); continue
-            answers = extract_only_answers_rlvr(content, K)
+            out.append(1.0 if extract_only_answers_rlvr(content, K) is not None else 0.0)
+        return out
+
+    if fmt == "rlcr_single_answer":
+        if not isinstance(K, int) or K <= 0:
+            return [0.0] * len(completions)
+        out = []
+        for content in contents:
+            if not check_content_has_required_tags(content, K, checkConfidences=True, format_pattern=fmt):
+                out.append(0.0); continue
+            answers, confs = _extract_single_candidate(content)
             if answers is None:
                 out.append(0.0); continue
-            out.append(1.0)
+            vals = [_safe_float(c) for c in confs]
+            out.append(1.0 if all(v is not None and 0.0 <= v <= 1.0 for v in vals) else 0.0)
         return out
 
-    def has_tag(tag): 
-        return tag in content
-
-    for content in completion_contents:
-        if fmt == "ta":
-            ok = has_tag("<think>") and has_tag("</think>") and has_tag("<answer>") and has_tag("</answer>")
-            out.append(1.0 if ok else 0.0)
-        elif fmt in ("tac", "tabc", "tbac"):
-            need_analysis = (fmt in ("tabc", "tbac"))
-            ok = has_tag("<think>") and has_tag("</think>") and has_tag("<answer>") and has_tag("</answer>")
-            if need_analysis:
-                ok = ok and has_tag("<analysis>") and has_tag("</analysis>")
-            if not ok:
+    if fmt == "rlvr_single_answer":
+        if not isinstance(K, int) or K <= 0:
+            return [0.0] * len(completions)
+        out = []
+        for content in contents:
+            if not check_content_has_required_tags(content, K, checkConfidences=False, format_pattern=fmt):
                 out.append(0.0); continue
-            last_conf = _extract_last_between(content, "<confidence>", "</confidence>")
-            v = _safe_float(last_conf)
-            out.append(1.0 if (v is not None and 0.0 <= v <= 1.0) else 0.0)
-        else:
-            out.append(0.0)
+            out.append(1.0 if extract_only_answers_rlvr(content, K) is not None else 0.0)
+        return out
+
+    # Legacy single-answer formats: ta, tac, tabc, tbac
+    out = []
+    for content in contents:
+        has = lambda tag: tag in content
+        ok  = has("<think>") and has("</think>") and has("<answer>") and has("</answer>")
+        if fmt in ("tabc", "tbac"):
+            ok = ok and has("<analysis>") and has("</analysis>")
+        if ok and fmt in ("tac", "tabc", "tbac"):
+            v  = _safe_float(_extract_last_between(content, "<confidence>", "</confidence>"))
+            ok = v is not None and 0.0 <= v <= 1.0
+        out.append(1.0 if ok else 0.0)
     return out
 
 
-# =========================
-# Response constraints reward (UNIQUENESS + SUM <= 1)
-# =========================
+# ---------------------------------------------------------------------------
+# Constraint reward  (uniqueness + sum of confidences ≤ 1)
+# ---------------------------------------------------------------------------
 
 def response_constraint_reward(completions, num_candidates=None, **kwargs):
     """
-    Returns a list of {0.0, 1.0} for multi-candidate only:
-      - Exactly K ordered pairs can be extracted
-      - All K answers unique 
-      - Sum(confidences) <= 1 
+    Returns 1.0 iff:
+    - All K candidates are unique (case-insensitive).
+    - Sum of confidences ≤ 1 (when confidences_sum_to_less_than_1=True, the default).
     """
-
-    #print("responseConstraintReward num_candidates before kwargs set", num_candidates)
-    #num_candidates = kwargs.get("num_candidates")
-    #print("responseConstraintReward num_candidates after kwargs set", num_candidates)
-
     if not isinstance(num_candidates, int) or num_candidates <= 0:
-        return [0.0 for _ in completions]
+        return [0.0] * len(completions)
 
+    enforce_sum = kwargs.get("confidences_sum_to_less_than_1", True)
     scores = []
-    
+
     for content in (c[0]["content"] for c in completions):
-        
         if num_candidates == 1:
             answers, confs = _extract_single_candidate(content)
         else:
             answers, confs = _extract_flat_candidates(content, num_candidates)
-        
-        #right number of answers and confidences 
-        if answers is None or len(answers) != num_candidates or len(confs) != num_candidates:
+
+        if answers is None or len(answers) != num_candidates:
             scores.append(0.0); continue
 
-        # uniqueness
+        # Uniqueness
         norm = [a.strip().lower() for a in answers]
         if len(set(norm)) != len(norm):
             scores.append(0.0); continue
@@ -367,123 +310,158 @@ def response_constraint_reward(completions, num_candidates=None, **kwargs):
         vals = [_safe_float(c) for c in confs]
         if any(v is None for v in vals):
             scores.append(0.0); continue
-        
-        #sum <= 1
-        s = float(np.sum(vals))
-        scores.append(1.0 if s <= 1.0 else 0.0)
-        
+
+        if enforce_sum and float(np.sum(vals)) > 1.0:
+            scores.append(0.0)
+        else:
+            scores.append(1.0)
+
     return scores
 
 
+def uniqueness_reward(format_pattern, completions, num_candidates=None, **kwargs):
+    """
+    Returns 1.0 iff all K candidates are distinct (case-insensitive, normalized).
+    Single-answer formats trivially return 1.0.
+    """
+    if not isinstance(num_candidates, int) or num_candidates <= 0:
+        return [0.0] * len(completions)
+
+    fmt = str(format_pattern).lower()
+    scores = []
+
+    for content in (c[0]["content"] for c in completions):
+        if fmt in ("multi_answer", "multi_answer_no_analysis"):
+            answers, _ = _extract_flat_candidates(content, num_candidates)
+        elif fmt == "multi_answer_rlvr":
+            answers = extract_only_answers_rlvr(content, num_candidates)
+        else:
+            scores.append(1.0); continue  # single-answer: trivially unique
+
+        if answers is None or len(answers) != num_candidates:
+            scores.append(0.0); continue
+
+        norm = [a.strip().lower() for a in answers]
+        scores.append(1.0 if len(set(norm)) == len(norm) else 0.0)
+
+    return scores
+
 
 def combined_format_and_constraint_reward(
-    completions,
-    format_pattern=None,
-    num_candidates=None,
-    **kwargs
+    completions, format_pattern=None, num_candidates=None, **kwargs
+):
+    """Returns 1.0 iff both format_reward and response_constraint_reward return 1.0."""
+    fmt_scores = format_reward(format_pattern, completions, num_candidates)
+    kw = {k: v for k, v in kwargs.items() if k != "num_candidates"}
+    con_scores = response_constraint_reward(completions, num_candidates=num_candidates, **kw)
+    return [f * c for f, c in zip(fmt_scores, con_scores)]
+
+
+# ---------------------------------------------------------------------------
+# Correctness helper
+# ---------------------------------------------------------------------------
+
+def _is_correct(cand: str, gold, source=None) -> bool:
+    """
+    Return True if cand matches any answer in gold.
+
+    For math datasets (source contains 'math', excluding hotpotQA/ambigQA/medDataset),
+    uses math-verify for structural equivalence; falls back to normalized exact match
+    only on parse/verify errors. For all other datasets, uses normalized exact match.
+    """
+    if not cand:
+        return False
+
+    gold_list  = list(gold) if isinstance(gold, (list, tuple)) else [gold]
+    source_name = (source[0] if isinstance(source, (list, tuple)) else source) if source else None
+    use_math = (
+        source_name is not None
+        and 'math' in str(source_name).lower()
+        and source_name not in ('hotpotQA', 'ambigQA', 'medDataset')
+    )
+
+    for g in gold_list:
+        if use_math:
+            try:
+                if verify(g, parse(cand)):
+                    return True
+                # verify returned False — don't fall back to exact match for this gold
+            except Exception:
+                if exact_match_score(cand, g):
+                    return True
+        else:
+            if exact_match_score(cand, g):
+                return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Accuracy reward
+# ---------------------------------------------------------------------------
+
+def accuracy_reward(
+    format_pattern, completions, answer=None, num_candidates=None, source=None, **kwargs
 ):
     """
-    Returns a list of {0.0, 1.0}: 1.0 iff BOTH
-      - response_format_reward(...) == 1.0
-      - response_constraint_reward(...) == 1.0
-    for the corresponding completion.
+    Returns 1.0 if any candidate matches a gold answer (binary), or fractional
+    credit equal to (# unique correct candidates / K) when more_than_one_correctness_pt=True.
+
+    Requires valid format. For multi-answer RLCR formats, also requires unique candidates
+    by default (override with enforceUniqueness=False).
+
+    Accepts both 'answer' and 'answers' dataset columns ('answers' takes priority).
     """
+    if "answers" in kwargs:
+        answer = kwargs["answers"]
+    elif answer is None:
+        answer = []
 
-    #print("In combined_format_and_constraint_reward as of 4:41 on saturday")
-    # 1) Format validity (uses format_pattern and kwargs such as k_expected/num_candidates)
-    fmt_scores = format_reward(
-        format_pattern,
-        completions,
-        num_candidates
-    )
-
-    # 2) Constraint validity (uniqueness + sum(conf) <= 1 - tol), only meaningful for multi-candidate
-    cons_scores = response_constraint_reward(
-        completions,
-        num_candidates=num_candidates,
-    )
-
-    # 3) Element-wise AND
-    out = []
-    for formatReward, constrainReward  in zip(fmt_scores, cons_scores):
-        # print("formatReward", formatReward)
-        # print("constrainReward", constrainReward)
-        out.append(formatReward*constrainReward)
-        # print("out", out)
-        # print("--------------------------------")
-    return out
-
-
-
-# =========================
-# Accuracy reward
-# =========================
-
-
-def accuracy_reward(format_pattern, completions, answer=None, num_candidates=None, source=None, **kwargs):
-    """
-    - If format_pattern == 'multi_answer': evaluate correctness of <answer1>...</answer1>.
-    - Else (old stuff): evaluate LAST <answer>...</answer>.
-    Uses try/except so bad parses can't mess up ranks.
-    Supports both "answer" and "answers" columns (prefers "answers" if both exist).
-    """
-    # Support both "answer" and "answers" columns
-    if answer is None:
-        answer = kwargs.get("answers", [])
-    elif "answers" in kwargs:
-        answer = kwargs["answers"]  # Prefer "answers" if both exist
-    
     fmt = str(format_pattern).lower()
     contents = [c[0]["content"] for c in completions]
-    correct_answers    = list(answer)
+
+    # Normalize gold answers to one entry per completion
+    if answer is None:
+        golds = [[] for _ in completions]
+    elif isinstance(answer, (list, tuple)) and len(answer) > 0 and isinstance(answer[0], str):
+        # Flat list of valid answers shared across all completions
+        golds = [list(answer)] * len(completions)
+    else:
+        golds = list(answer)
+        if len(golds) < len(completions):
+            last = golds[-1] if golds else []
+            golds += [last] * (len(completions) - len(golds))
+        golds = golds[:len(completions)]
+
+    more_than_one    = kwargs.get("more_than_one_correctness_pt", False)
+    enforce_uniqueness = kwargs.get(
+        "enforceUniqueness", fmt in ("multi_answer", "multi_answer_no_analysis")
+    )
+
+    fmt_scores  = format_reward(format_pattern, completions, num_candidates=num_candidates, **kwargs)
+    uniq_scores = (
+        uniqueness_reward(format_pattern, completions, num_candidates=num_candidates)
+        if enforce_uniqueness else [1.0] * len(completions)
+    )
+
     out = []
-
-    #print("num_candidates after kwargs set", num_candidates)
-    
-    #num_candidates = kwargs.get("num_candidates")
-    # Pre-checks to keep ranks aligned
-
-    #print("num_candidates ", num_candidates)
-    fmt_scores = format_reward(format_pattern, completions, num_candidates=num_candidates, **kwargs)
-    reward_constraint_scores  = (response_constraint_reward(completions, num_candidates=num_candidates)
-                  if fmt == "multi_answer" else [1.0]*len(completions))
-
-    #if format or response constraint is 0, then acc gets zeroed out 
-    for content, correct_answer, format_reward_score, reward_constraint_score in zip(contents, correct_answers, fmt_scores, reward_constraint_scores):
-        if format_reward_score == 0 or reward_constraint_score == 0:
-            out.append(0.0)
-            #print("either format reward or reward constraint is 0", format_reward_score, reward_constraint_score)
-            continue
-
+    for content, gold, fs, us in zip(contents, golds, fmt_scores, uniq_scores):
+        if fs == 0 or us == 0:
+            out.append(0.0); continue
         try:
-            # Collect candidates depending on the format
-            if fmt == "multi_answer":
-                # Assume candidates are in tags like <answer1> ... </answer1>, <answer2> ... </answer2>, etc.
-                candidates = [
-                    _extract_last_between(content, f"<answer{i}>", f"</answer{i}>")
-                    for i in range(1, num_candidates + 1)
-                ]
-                #print("HIHIHIHI candidates", candidates)
-            elif fmt == "rlvr_single_answer":
-                candidates = [_extract_last_between(content, "<answer>", "</answer>")]
-                #print("only one candidate", candidates)
+            if fmt in ("multi_answer", "multi_answer_no_analysis"):
+                answers, _ = _extract_flat_candidates(content, num_candidates)
+                candidates  = answers or []
             elif fmt == "multi_answer_rlvr":
-                candidates = extract_only_answers_rlvr(content, num_candidates)
+                candidates  = extract_only_answers_rlvr(content, num_candidates) or []
+            else:
+                candidates  = [_extract_last_between(content, "<answer>", "</answer>")]
 
-            else: #single answer rlcr
-                candidates = [_extract_last_between(content, "<answer>", "</answer>")]
-
-            # Check if ANY candidate matches ANY of the correct answers
-            correct = False
-            for cand in candidates:
-                if not cand:
-                    continue
-                if _is_correct(cand, correct_answer, source):
-                    correct = True
-                    break
-
-            out.append(1.0 if correct else 0.0)
-
+            if more_than_one:
+                n_correct = len({c.strip() for c in candidates if c and _is_correct(c, gold, source)})
+                out.append(float(n_correct) / num_candidates)
+            else:
+                out.append(1.0 if any(_is_correct(c, gold, source) for c in candidates if c) else 0.0)
         except Exception as e:
             print(e)
             out.append(0.0)
@@ -491,328 +469,337 @@ def accuracy_reward(format_pattern, completions, answer=None, num_candidates=Non
     return out
 
 
+# ---------------------------------------------------------------------------
+# Pass@k / num_correct@k metrics
+# ---------------------------------------------------------------------------
+
+def _rank_by_confidence(answers, confs):
+    """Return answers sorted by their confidence values, highest first."""
+    scored = []
+    for ans, conf in zip(answers, confs):
+        v = _safe_float(conf)
+        scored.append((max(0.0, min(1.0, v)) if v is not None else -1.0, ans))
+    return [a for _, a in sorted(scored, key=lambda t: t[0], reverse=True)]
 
 
-
-
-
-def _is_correct(cand: str, gold, source=None) -> bool:
-    """Check if candidate matches gold answer(s).
-    gold can be a single string or a list of strings (multiple correct answers).
-    Returns True if cand matches any of the gold answers."""
- 
-    if not cand:
-        return False
-    
-    # Handle multiple gold answers
-    if isinstance(gold, (list, tuple)):
-        gold_list = gold
-    else:
-        gold_list = [gold]
-    
-    try:
-        for g in gold_list:
-            # Check if this is a math problem that requires verification
-            # Use math verification only for explicitly math-related sources
-            use_math_verification = False
-            if source is not None and len(source) > 0:
-                source_name = source[0] if isinstance(source, (list, tuple)) else source
-                # Only use math verification for math datasets (not for text-based like medical, QA, etc.)
-                use_math_verification = 'math' in str(source_name).lower() and source_name not in ['hotpotQA', 'ambigQA', 'medDataset']
-            
-            if use_math_verification:
-                # Try math verification for math problems
-                try:
-                    if verify(g, parse(cand)):
-                        return True
-                except Exception:
-                    # If math verification fails, fall back to text matching
-                    if exact_match_score(cand, g):
-                        return True
-            else:
-                # Default to text matching for all text-based answers (medical, QA, etc.)
-                if exact_match_score(cand, g):
-                    return True
-    
-        #print("no match found, return false, cand, gold", cand, gold)
-        return False
-    except Exception:
-        # Fallback: try exact_match_score if everything else fails
-        try:
-            for g in gold_list:
-                if exact_match_score(cand, g):
-                    return True
-        except Exception:
-            pass
-        #print("exception in _is_correct, return false, cand, gold", cand, gold)
-        return False
-
-
-def pass_at_1(format_pattern, completions, answer=None, num_candidates=None, source=None, **kwargs):
+def pass_at_1(
+    format_pattern, completions, answer=None, num_candidates=None, source=None, **kwargs
+):
     """
-    pass@1 reward:
-      - RLVR single / RLCR single: 1 iff the (only) answer is correct.
-      - RLVR multiple: 1 iff the FIRST candidate is correct.
-      - RLCR multiple: 1 iff the HIGHEST-CONFIDENCE candidate is correct.
-    Returns a list of {0.0, 1.0} per completion.
-    Supports both "answer" and "answers" columns (prefers "answers" if both exist).
+    Returns 1.0 if the model's primary answer is correct:
+    - Single-answer: the answer tag contents.
+    - RLVR multi: the first candidate (rank 1 by order).
+    - RLCR multi: the highest-confidence candidate.
     """
-    # Support both "answer" and "answers" columns
-    if answer is None:
-        answer = kwargs.get("answers", [])
-    elif "answers" in kwargs:
-        answer = kwargs["answers"]  # Prefer "answers" if both exist
-    
-    fmt = str(format_pattern).lower()
-    contents = [c[0]["content"] for c in completions]
-    golds = list(answer)
+    if "answers" in kwargs:
+        answer = kwargs["answers"]
+    elif answer is None:
+        answer = []
 
-    # Enforce formatting to avoid false positives
-    fmt_scores = format_reward(format_pattern, completions, num_candidates=num_candidates, **kwargs)
+    fmt        = str(format_pattern).lower()
+    K          = num_candidates
+    contents   = [c[0]["content"] for c in completions]
+    golds      = list(answer)
+    fmt_scores = format_reward(format_pattern, completions, num_candidates=K, **kwargs)
 
     out = []
-    if fmt in ("rlvr_single_answer", "rlcr_single_answer"):
-        for content, gold, fr in zip(contents, golds, fmt_scores):
-            if fr == 0:
-                out.append(0.0); continue
+    for content, gold, fr in zip(contents, golds, fmt_scores):
+        if fr == 0:
+            out.append(0.0); continue
+
+        if fmt in ("rlvr_single_answer", "rlcr_single_answer"):
             cand = _extract_last_between(content, "<answer>", "</answer>")
-            out.append(1.0 if _is_correct(cand, gold, source) else 0.0)
-        return out
-
-    if fmt == "multi_answer_rlvr":
-        K = num_candidates
-        for content, gold, fr in zip(contents, golds, fmt_scores):
-            if fr == 0:
-                out.append(0.0); continue
+        elif fmt == "multi_answer_rlvr":
             cands = extract_only_answers_rlvr(content, K)
-            first = cands[0] if cands else ""
-            out.append(1.0 if _is_correct(first, gold, source) else 0.0)
-        return out
-
-    if fmt == "multi_answer":
-        K = num_candidates
-        for content, gold, fr in zip(contents, golds, fmt_scores):
-            if fr == 0:
-                out.append(0.0); continue
+            cand  = cands[0] if cands else ""
+        elif fmt in ("multi_answer", "multi_answer_no_analysis"):
             answers, confs = _extract_flat_candidates(content, K)
-            if not answers or not confs:
-                out.append(0.0); continue
+            cand = _rank_by_confidence(answers, confs)[0] if answers and confs else ""
+        else:
+            cand = ""
 
-            # Choose highest-confidence candidate
-            best_idx, best_conf = -1, -1.0
-            for j, conf in enumerate(confs):
-                v = _safe_float(conf)
-                v = -1.0 if v is None else max(0.0, min(1.0, v))
-                if v > best_conf:
-                    best_conf, best_idx = v, j
+        out.append(1.0 if _is_correct(cand, gold, source) else 0.0)
 
-            chosen = answers[best_idx] if best_idx >= 0 else ""
-            out.append(1.0 if _is_correct(chosen, gold, source) else 0.0)
-        return out
-
-    # Unknown format
-    return [0.0 for _ in completions]
+    return out
 
 
-def pass_at_i(format_pattern, completions, answer=None, num_candidates=None, i=None, source=None, **kwargs):
+def pass_at_i(
+    format_pattern, completions, answer=None, num_candidates=None, i=None, source=None, **kwargs
+):
     """
-    pass@i reward:
-      - RLVR single / RLCR single:
-           * Only i == 1 supported; else raises ValueError.
-      - RLVR multiple:
-           * 1 iff ANY of the first i candidates (in order) is correct.
-      - RLCR multiple:
-           * Rank candidates by confidence (desc) and return 1 iff ANY of the top i is correct.
-    Returns a list of {0.0, 1.0} per completion.
-    Supports both "answer" and "answers" columns (prefers "answers" if both exist).
+    Returns 1.0 if any of the top-i candidates is correct:
+    - Single-answer: only i=1 is supported.
+    - RLVR multi: top-i in sequence order.
+    - RLCR multi: top-i by confidence.
     """
     if not isinstance(i, int) or i <= 0:
         raise ValueError("pass_at_i expects i to be a positive integer.")
-    
-    # Support both "answer" and "answers" columns
-    if answer is None:
-        answer = kwargs.get("answers", [])
-    elif "answers" in kwargs:
-        answer = kwargs["answers"]  # Prefer "answers" if both exist
+
+    if "answers" in kwargs:
+        answer = kwargs["answers"]
+    elif answer is None:
+        answer = []
 
     fmt = str(format_pattern).lower()
-    contents = [c[0]["content"] for c in completions]
-    golds = list(answer)
 
-    # Enforce formatting to avoid false positives
-    fmt_scores = format_reward(format_pattern, completions, num_candidates=num_candidates, **kwargs)
-
-    # SINGLE-ANSWER: only i==1
     if fmt in ("rlvr_single_answer", "rlcr_single_answer"):
         if i != 1:
             raise ValueError("pass_at_i for single-answer formats only supports i=1.")
         return pass_at_1(format_pattern, completions, answer, num_candidates, source=source, **kwargs)
 
+    K          = num_candidates
+    contents   = [c[0]["content"] for c in completions]
+    golds      = list(answer)
+    fmt_scores = format_reward(format_pattern, completions, num_candidates=K, **kwargs)
+
     out = []
+    for content, gold, fr in zip(contents, golds, fmt_scores):
+        if fr == 0:
+            out.append(0.0); continue
 
-    # MULTI-ANSWER RLVR: sequential order, take first i
-    if fmt == "multi_answer_rlvr":
-        K = num_candidates
-        for content, gold, fr in zip(contents, golds, fmt_scores):
-            if fr == 0:
-                out.append(0.0); continue
-            cands = extract_only_answers_rlvr(content, K)
-            if not cands:
-                out.append(0.0); continue
-            top = cands[:min(i, len(cands))]
-            ok = any(_is_correct(c, gold, source) for c in top)
-            out.append(1.0 if ok else 0.0)
-        return out
-
-    # MULTI-ANSWER RLCR: rank by confidence desc, then take top i
-    if fmt == "multi_answer":
-        K = num_candidates
-        for content, gold, fr in zip(contents, golds, fmt_scores):
-            if fr == 0:
-                out.append(0.0); continue
-
+        if fmt == "multi_answer_rlvr":
+            cands = extract_only_answers_rlvr(content, K) or []
+            top   = cands[:i]
+        elif fmt in ("multi_answer", "multi_answer_no_analysis"):
             answers, confs = _extract_flat_candidates(content, K)
-            if not answers or not confs:
-                out.append(0.0); continue
+            top = _rank_by_confidence(answers, confs)[:i] if answers and confs else []
+        else:
+            top = []
 
-            scored = []
-            for ans, conf in zip(answers, confs):
-                v = _safe_float(conf)
-                v = -1.0 if v is None else max(0.0, min(1.0, v))
-                scored.append((v, ans))
-            scored.sort(key=lambda t: t[0], reverse=True)
+        out.append(1.0 if any(_is_correct(c, gold, source) for c in top) else 0.0)
 
-            top_i_answers = [a for _, a in scored[:min(i, len(scored))]]
-            ok = any(_is_correct(c, gold, source) for c in top_i_answers)
-            out.append(1.0 if ok else 0.0)
-        return out
-
-    # Unknown format
-    return [0.0 for _ in completions]
+    return out
 
 
+def num_correct_at_i(
+    format_pattern, completions, answer=None, num_candidates=None, i=None, source=None, **kwargs
+):
+    """
+    Returns the count of correct answers (float) among the top-i candidates:
+    - Single-answer: only i=1 is supported.
+    - RLVR multi: first i in sequence order.
+    - RLCR multi: top i by confidence.
+    """
+    if not isinstance(i, int) or i <= 0:
+        raise ValueError("num_correct_at_i expects i to be a positive integer.")
+
+    if "answers" in kwargs:
+        answer = kwargs["answers"]
+    elif answer is None:
+        answer = []
+
+    fmt = str(format_pattern).lower()
+
+    if fmt in ("rlvr_single_answer", "rlcr_single_answer"):
+        if i != 1:
+            raise ValueError("num_correct_at_i for single-answer formats only supports i=1.")
+        return pass_at_1(format_pattern, completions, answer, num_candidates, source=source, **kwargs)
+
+    K          = num_candidates
+    contents   = [c[0]["content"] for c in completions]
+    golds      = list(answer)
+    fmt_scores = format_reward(format_pattern, completions, num_candidates=K, **kwargs)
+
+    out = []
+    for content, gold, fr in zip(contents, golds, fmt_scores):
+        if fr == 0:
+            out.append(0.0); continue
+
+        if fmt == "multi_answer_rlvr":
+            cands = extract_only_answers_rlvr(content, K) or []
+            top   = cands[:i]
+        elif fmt in ("multi_answer", "multi_answer_no_analysis"):
+            answers, confs = _extract_flat_candidates(content, K)
+            top = _rank_by_confidence(answers, confs)[:i] if answers and confs else []
+        else:
+            top = []
+
+        out.append(float(sum(1 for c in top if _is_correct(c, gold, source))))
+
+    return out
 
 
-
-# =========================
-# Brier reward (per-completion, over K candidates)
-# =========================
-
+# ---------------------------------------------------------------------------
+# Brier score reward
+# ---------------------------------------------------------------------------
 
 def brier_reward(format_pattern, completions, answer=None, source=None, **kwargs):
     """
-    reward = 1 - mean_i (y_i - p_i)^2, where
-      y_i is correctness of candidate i,
-      p_i is the model's confidence_i 
-    Supports both "answer" and "answers" columns (prefers "answers" if both exist).
-    """
-    # Support both "answer" and "answers" columns
-    if answer is None:
-        answer = kwargs.get("answers", [])
-    elif "answers" in kwargs:
-        answer = kwargs["answers"]  # Prefer "answers" if both exist
-    
-    fmt = str(format_pattern).lower()
-    # if fmt != "multi_answer":
-    #     # rn i'm not doing non-multi-answer things - when we release the code we can put back the single answer brier score - im tired and dont wanna add it back rn 
-    #     return [0.0 for _ in completions]
+    Returns 1 - mean_i((y_i - p_i)^2) per completion, where:
+      y_i = 1 if candidate i is correct, else 0
+      p_i = model's stated confidence for candidate i
 
-    K = kwargs.get("k_expected", kwargs.get("num_candidates"))
+    Requires valid format and constraint (unique answers, sum ≤ 1).
+    """
+    if "answers" in kwargs:
+        answer = kwargs["answers"]
+    elif answer is None:
+        answer = []
+
+    fmt = str(format_pattern).lower()
+    K   = kwargs.get("num_candidates")
     if not isinstance(K, int) or K <= 0:
-        return [0.0 for _ in completions]
+        return [0.0] * len(completions)
 
     contents = [c[0]["content"] for c in completions]
-    correct_answers    = list(answer)
+    golds    = list(answer)
+    kw       = {k: v for k, v in kwargs.items() if k != "num_candidates"}
 
-    format_reward_scores = format_reward(format_pattern, completions, **kwargs)
-    reward_constraint_scores  = response_constraint_reward(completions, num_candidates=K)
+    fmt_scores = format_reward(format_pattern, completions, num_candidates=K, **kw)
+    con_scores = response_constraint_reward(completions, num_candidates=K, **kw)
 
     rewards = []
-    for content, correct_answer, fr, rc in zip(contents, correct_answers, format_reward_scores, reward_constraint_scores):
-        if fr == 0 or rc == 0:
+    for content, gold, fs, cs in zip(contents, golds, fmt_scores, con_scores):
+        if fs == 0 or cs == 0:
             rewards.append(0.0); continue
 
-        if format_pattern == "rlcr_single_answer":
-            answers, confs = _extract_single_candidate(content) 
-        else:
-            answers, confs = _extract_flat_candidates(content, K)
-        
+        is_single = fmt in ("rlcr_single_answer", "rlvr_single_answer", "ta", "tac", "tabc", "tbac") or K == 1
+        answers, confs = (
+            _extract_single_candidate(content) if is_single
+            else _extract_flat_candidates(content, K)
+        )
+
         if answers is None:
             rewards.append(0.0); continue
 
         sq_errs = []
         for cand, conf in zip(answers, confs):
-            try:
-                p = _safe_float(conf)
-                p = 0.0 if p is None else max(0.0, min(1.0, p))
-                y = float(bool(_is_correct(cand, correct_answer, source)))
-                sq_errs.append((y - p) ** 2)
-            except Exception:
-                # Treat any failure as wrong answer with p=clip(conf)
-                p = _safe_float(conf)
-                p = 0.0 if p is None else max(0.0, min(1.0, p))
-                sq_errs.append((0.0 - p) ** 2)
+            p = _safe_float(conf)
+            p = max(0.0, min(1.0, p)) if p is not None else 0.0
+            y = float(_is_correct(cand, gold, source))
+            sq_errs.append((y - p) ** 2)
 
-        avg_mse = sum(sq_errs) / len(sq_errs) if sq_errs else 1.0
-        rewards.append(1.0 - avg_mse)
+        rewards.append(1.0 - (sum(sq_errs) / len(sq_errs)))
+
     return rewards
 
 
-def mean_confidence_reward(completions, **kwargs):
-    """Reward function that extracts the last occurrence of text inside the answer tags and then checks if a label is present there"""
-    confidence_pattern = r"<confidence>(.*?)</confidence>"
-    completion_contents = [completion[0]["content"] for completion in completions]
-    matches = []
+# ---------------------------------------------------------------------------
+# Entropy reward (token-level, from precomputed logits)
+# ---------------------------------------------------------------------------
 
-    for content in completion_contents:
-        confidence_matches = re.findall(confidence_pattern, content, re.DOTALL | re.MULTILINE)  # Get all <confidence>...</confidence> occurrences
-        last_confidence = confidence_matches[-1] if confidence_matches else ""  # Get the last confidence, if exists
-        if last_confidence == "":
-            matches.append(0.0)
+def entropy_from_logits(logits: "torch.Tensor", chunk_size: int = 128) -> "torch.Tensor":
+    """
+    Compute per-token Shannon entropy (nats) from logits, memory-efficiently.
+    Matches the entropy implementation in trainer_utils.py used for wandb logging.
+    """
+    original_shape = logits.shape[:-1]
+    flat = logits.reshape(-1, logits.shape[-1])
+    chunks = []
+    for chunk in flat.split(chunk_size):
+        logps = F.log_softmax(chunk, dim=-1)
+        chunks.append(-(torch.exp(logps) * logps).sum(-1))
+    return torch.cat(chunks).reshape(original_shape)
+
+
+def entropy_reward(format_pattern, completions, **kwargs):
+    """
+    Returns per-completion mean token entropy, normalized to [0, 1] by log(vocab_size),
+    with an optional linear decay applied over training steps.
+
+    Higher entropy → higher reward (encourages diverse/exploratory generation).
+
+    Requires kwarg:
+        precomputed_entropies (torch.Tensor [n, seq_len]): entropy per token per completion,
+            computed during the training forward pass to avoid redundant computation.
+
+    Optional kwargs:
+        completion_mask (torch.Tensor [n, seq_len]): masks padding tokens.
+        tokenizer: used to get vocab_size (defaults to Qwen3's 151936).
+        trainer_state: provides global_step and max_steps for decay scheduling.
+        entropy_decay_start_step (int, default=200): step when decay begins.
+        entropy_decay_final_factor (float, default=0.0): multiplier at max_steps.
+    """
+    if torch is None:
+        warnings.warn("Entropy reward: torch not available. Returning zeros.")
+        return [0.0] * len(completions)
+
+    precomputed = kwargs.get("precomputed_entropies")
+    if precomputed is None:
+        warnings.warn("Entropy reward: precomputed_entropies not provided. Returning zeros.")
+        return [0.0] * len(completions)
+
+    try:
+        if not isinstance(precomputed, torch.Tensor):
+            precomputed = torch.tensor(precomputed)
+
+        # Compute mean entropy per completion, respecting the completion mask
+        mask = kwargs.get("completion_mask")
+        if mask is not None:
+            if not isinstance(mask, torch.Tensor):
+                mask = torch.tensor(mask, device=precomputed.device)
+            mask = mask.to(precomputed.device)
+            # Align seq_len if the trainer and reward fn see different padding
+            if precomputed.shape[1] != mask.shape[1]:
+                min_len = min(precomputed.shape[1], mask.shape[1])
+                precomputed, mask = precomputed[:, :min_len], mask[:, :min_len]
+            mean_ent = (precomputed * mask.float()).sum(1) / mask.sum(1).clamp(min=1.0)
         else:
-            try:
-                confidence = float(last_confidence)
-                #clip confidence to be between 0 and 1
-                confidence = max(0.0, min(confidence, 1.0))
-            except:
-                confidence = 0.0
-            matches.append(confidence)
-    return matches
+            mean_ent = precomputed.mean(dim=1)
+
+        # Normalize to [0, 1] by dividing by maximum possible entropy = log(vocab_size)
+        tokenizer  = kwargs.get("tokenizer")
+        vocab_size = getattr(tokenizer, "vocab_size", 151936) if tokenizer else 151936
+        normalized = (mean_ent / math.log(vocab_size)).clamp(0.0, 1.0)
+
+        # Linear decay: full reward before decay_start_step, then linear ramp to final_factor
+        decay = 1.0
+        state = kwargs.get("trainer_state")
+        if state is not None and hasattr(state, "global_step"):
+            step      = state.global_step
+            max_steps = (
+                getattr(state, "max_steps", None)
+                or getattr(getattr(state, "args", None), "max_steps", None)
+                or max(1000, step * 10)
+            )
+            start = kwargs.get("entropy_decay_start_step", 200)
+            final = kwargs.get("entropy_decay_final_factor", 0.0)
+            if step >= start:
+                progress = min(1.0, (step - start) / max(1, max_steps - start))
+                decay    = 1.0 - (1.0 - final) * progress
+
+        normalized = normalized * decay
+
+        # Align length to number of completions (guard against shape mismatches)
+        n = len(completions)
+        if len(normalized) != n:
+            warnings.warn(f"Entropy reward: shape mismatch ({len(normalized)} vs {n}). Adjusting.")
+            if len(normalized) > n:
+                normalized = normalized[:n]
+            else:
+                pad = torch.zeros(n - len(normalized), device=normalized.device)
+                normalized = torch.cat([normalized, pad])
+
+        return normalized.cpu().tolist()
+
+    except Exception as e:
+        warnings.warn(f"Entropy reward: failed ({e}). Returning zeros.")
+        return [0.0] * len(completions)
+
+
+# ---------------------------------------------------------------------------
+# Confidence analysis rewards (diagnostic / logging)
+# ---------------------------------------------------------------------------
+
+def mean_confidence_reward(completions, **kwargs):
+    """Returns the model's last stated confidence value clipped to [0, 1], or 0.0 if absent."""
+    out = []
+    for completion in completions:
+        matches = re.findall(r"<confidence>(.*?)</confidence>", completion[0]["content"], re.DOTALL)
+        v = _safe_float(matches[-1]) if matches else None
+        out.append(max(0.0, min(1.0, v)) if v is not None else 0.0)
+    return out
+
 
 def confidence_one_or_zero(completions, **kwargs):
-    """Reward function that extracts the last occurrence of text inside the answer tags and then checks if a label is present there"""
-    confidence_pattern = r"<confidence>(.*?)</confidence>"
-    completion_contents = [completion[0]["content"] for completion in completions]
-    matches = []
-
-    for content in completion_contents:
-        confidence_matches = re.findall(confidence_pattern, content, re.DOTALL | re.MULTILINE)  # Get all <confidence>...</confidence> occurrences
-        last_confidence = confidence_matches[-1] if confidence_matches else ""  # Get the last confidence, if exists
-        if last_confidence == "":
-            matches.append(0.0)
+    """Returns 1.0 if the model's last confidence is essentially 0 or 1 (within 0.01), else 0.0."""
+    out = []
+    for completion in completions:
+        matches = re.findall(r"<confidence>(.*?)</confidence>", completion[0]["content"], re.DOTALL)
+        v = _safe_float(matches[-1]) if matches else None
+        if v is not None:
+            v = max(0.0, min(1.0, v))
+            out.append(1.0 if abs(v) < 0.01 or abs(v - 1.0) < 0.01 else 0.0)
         else:
-            try:
-                confidence = float(last_confidence)
-                #clip confidence to be between 0 and 1
-                confidence = max(0.0, min(confidence, 1.0))
-            except:
-                confidence = 0.0
-            if abs(confidence - 1) < 0.01 or abs(confidence - 0) < 0.01:
-                matches.append(1.0)
-            else:
-                matches.append(0.0)
-    return matches
-
-
-
-
-
-
-
-if __name__ == '__main__':
-    s = "    h   ello whatever </think> <answer> The number of non-empty subsets 31 </answer> <confidence> 0.9 </confidence>   \n \n  "
- 
-    pattern = r".*?</think>\s*<answer>.*?</answer>\s*<confidence>.*?</confidence>\s*\Z" 
-    match = re.match(pattern, s, re.DOTALL | re.MULTILINE)
-    print(match)
-    print(match[0])
+            out.append(0.0)
+    return out

@@ -1,0 +1,25 @@
+[
+    {
+      "dataset_name": "mehuldamani/medDataset_25k",
+      "hash_key": "problem",
+      "store_name": "mehuldamani/medTroubleshootig-rlvr-520-evaled-on-rlvr",
+      "gpu_memory_utilization": 0.9,
+      "log_path": "results/medical/medTroubleshootig-rlvr-520-evaled-on-rlvr",
+      "split": "test",
+      "sample_size": 5000
+    },
+    {
+      "name": "rlvr-multi-standard-chkpt220",
+      "model": "<path-to-model-or-hf-id>",
+      "check_fn": "confidence_verifier",
+      "sys_prompt_name": "multi_answer_rlvr_medical",
+      "vllm_task": ["confidence_at_end", "ans_at_end"],
+      "n": 1,
+      "num_candidates": 3,
+      "pass_k_vals": [1],
+      "temperature": 0.7,
+      "max_tokens": 1536,
+      "seed": 42,
+      "check_fn_args": {"format_pattern": "multi_answer_rlvr"}
+    }
+  ]

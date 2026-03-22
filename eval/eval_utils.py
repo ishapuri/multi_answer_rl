@@ -101,6 +101,48 @@ def get_ece(correctness,confidence):
     return ece
 
 def get_auroc(correctness,confidence):
-    fpr, tpr, _ = roc_curve(correctness, confidence)
-    auroc = auc(fpr, tpr)
-    return auroc
+    # Handle empty arrays
+    if len(correctness) == 0 or len(confidence) == 0:
+        return np.nan
+    
+    # Convert to numpy arrays and ensure they have the same length
+    correctness = np.array(correctness)
+    confidence = np.array(confidence)
+    
+    if len(correctness) != len(confidence):
+        return np.nan
+    
+    # Check if correctness contains valid binary values
+    unique_values = np.unique(correctness)
+    
+    # If no valid values or only one class, AUROC is undefined
+    if len(unique_values) == 0:
+        return np.nan
+    elif len(unique_values) == 1:
+        # Only one class present (all 0s or all 1s), AUROC is undefined
+        return np.nan
+    
+    # Ensure correctness is binary (0/1)
+    # Check if values are already in {0, 1} or {-1, 1}
+    if set(unique_values).issubset({0, 1}):
+        # Already in correct format
+        pass
+    elif set(unique_values).issubset({-1, 1}):
+        # Convert -1/1 to 0/1
+        correctness = (correctness + 1) / 2
+    else:
+        # Unexpected values, try to convert or return NaN
+        # If values are boolean-like, convert to int
+        if set(unique_values).issubset({True, False}):
+            correctness = correctness.astype(int)
+        else:
+            # Invalid values for binary classification
+            return np.nan
+    
+    try:
+        fpr, tpr, _ = roc_curve(correctness, confidence)
+        auroc = auc(fpr, tpr)
+        return auroc
+    except ValueError as e:
+        # Handle any remaining edge cases
+        return np.nan

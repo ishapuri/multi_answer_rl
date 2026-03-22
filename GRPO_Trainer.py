@@ -311,6 +311,15 @@ class GRPOTrainer(BaseTrainer):
             self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
         else:
             self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)/ len(reward_funcs)
+        
+        # Store original reward weights and find brier index for adaptive weight
+        self.original_reward_weights = self.reward_weights.clone()
+        # Find the index of "brier" reward function
+        self.brier_weight_index = None
+        for i, name in enumerate(self.reward_func_names):
+            if "brier" in name.lower():
+                self.brier_weight_index = i
+                break
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -414,7 +423,20 @@ class GRPOTrainer(BaseTrainer):
 
         # Reference model
         self.beta = args.beta
-        if self.beta == 0.0:
+        self.adaptive_beta = getattr(args, 'adaptive_beta', False)
+        self.target_kl = getattr(args, 'target_kl', None)
+        self.adaptive_beta_lr = getattr(args, 'adaptive_beta_lr', 0.1)
+        
+        # If adaptive beta is enabled, we need a reference model
+        if self.adaptive_beta and self.target_kl is not None:
+            if self.beta == 0.0:
+                # Initialize beta to a small positive value for adaptive control
+                self.beta = 0.01
+            # For deepspeed, fsdp or non-distributed models, create a reference model from scratch
+            config = AutoConfig.from_pretrained(model_id)
+            architecture = getattr(transformers, config.architectures[0])
+            self.ref_model = architecture.from_pretrained(model_id, **model_init_kwargs)
+        elif self.beta == 0.0:
             # If beta is 0.0, the reference model is not needed
             self.ref_model = None
         else:
@@ -446,6 +468,10 @@ class GRPOTrainer(BaseTrainer):
         # Initialize the metrics
         self._metrics = {"train": defaultdict(list), "eval": defaultdict(list)}
         self._total_train_tokens = 0
+        self._last_beta_update_step = -1  # Track last step we updated beta
+        # Track accumulated KL for adaptive beta (across gradient accumulation batches)
+        self._accumulated_kl_sum = 0.0
+        self._accumulated_kl_count = 0
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
@@ -530,6 +556,9 @@ class GRPOTrainer(BaseTrainer):
             # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
             # synchronize all processes after vLLM has been fully initialized.
             self.accelerator.wait_for_everyone()
+        
+        # Use training model as judge if needed (no separate GPU required)
+        # The training model and tokenizer will be passed via reward_kwargs
        
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
@@ -858,7 +887,7 @@ class GRPOTrainer(BaseTrainer):
         return inputs
 
     @profiling_decorator
-    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list):
+    def _calculate_rewards(self, inputs, prompts, completions, completion_ids_list, precomputed_entropies=None):
         device = self.accelerator.device
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
 
@@ -866,8 +895,64 @@ class GRPOTrainer(BaseTrainer):
         keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
         reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
 
-        # This allows for dynamic reward shaping based on training progress.
+        # Pass trainer state for step-dependent reward scheduling (e.g. entropy decay)
         reward_kwargs["trainer_state"] = self.state
+
+        # Pass tokenizer so reward functions can look up vocab_size etc.
+        if hasattr(self.processing_class, 'tokenizer'):
+            reward_kwargs["tokenizer"] = self.processing_class.tokenizer
+        else:
+            reward_kwargs["tokenizer"] = self.processing_class
+
+        # Add more_than_one_correctness_point parameter if available
+        if hasattr(self.args, 'more_than_one_correctness_point'):
+            reward_kwargs["more_than_one_correctness_pt"] = self.args.more_than_one_correctness_point
+        
+        # Add enforce_uniqueness parameter if available
+        if hasattr(self.args, 'enforce_uniqueness') and self.args.enforce_uniqueness is not None:
+            reward_kwargs["enforceUniqueness"] = self.args.enforce_uniqueness
+        
+        # Add confidences_sum_to_less_than_1 parameter if available
+        if hasattr(self.args, 'confidences_sum_to_less_than_1'):
+            reward_kwargs["confidences_sum_to_less_than_1"] = self.args.confidences_sum_to_less_than_1
+        
+        # Add temperature for entropy reward (matches training temperature)
+        reward_kwargs["temperature"] = self.temperature
+        
+        # Add entropy decay parameters if available
+        if hasattr(self.args, 'entropy_decay_start_step'):
+            reward_kwargs["entropy_decay_start_step"] = self.args.entropy_decay_start_step
+        if hasattr(self.args, 'entropy_decay_final_factor'):
+            reward_kwargs["entropy_decay_final_factor"] = self.args.entropy_decay_final_factor
+        
+        # Pass pre-computed entropies if available (to avoid redundant forward passes)
+        if precomputed_entropies is not None:
+            # Ensure precomputed_entropies is on the correct device
+            reward_kwargs["precomputed_entropies"] = precomputed_entropies.to(device) if isinstance(precomputed_entropies, torch.Tensor) else precomputed_entropies
+            
+            # Get completion_mask from inputs to properly mask entropies
+            # inputs is a list of dicts, where each dict corresponds to one prompt
+            # Each dict has completion_mask of shape (num_generations, seq_len)
+            # We need to concatenate them to match precomputed_entropies shape (total_completions, seq_len)
+            if len(inputs) > 0 and isinstance(inputs[0], dict) and "completion_mask" in inputs[0]:
+                completion_mask_list = [inp["completion_mask"] for inp in inputs]
+                # Each completion_mask is shape (num_generations, seq_len) or (seq_len,)
+                # Concatenate along first dimension to get (total_completions, seq_len)
+                if isinstance(completion_mask_list[0], torch.Tensor):
+                    # Reshape if needed: if 1D, add batch dimension; if 2D, concatenate
+                    if completion_mask_list[0].dim() == 1:
+                        # Single completion per input, stack them
+                        reward_kwargs["completion_mask"] = torch.stack(completion_mask_list, dim=0).to(device)
+                    else:
+                        # Multiple completions per input, concatenate them
+                        reward_kwargs["completion_mask"] = torch.cat(completion_mask_list, dim=0).to(device)
+                else:
+                    # Convert to tensors first
+                    tensors = [torch.tensor(cm, device=device) for cm in completion_mask_list]
+                    if tensors[0].dim() == 1:
+                        reward_kwargs["completion_mask"] = torch.stack(tensors, dim=0)
+                    else:
+                        reward_kwargs["completion_mask"] = torch.cat(tensors, dim=0)
 
         for i, (reward_func, reward_processing_class, reward_func_name) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes, self.reward_func_names)
@@ -887,7 +972,7 @@ class GRPOTrainer(BaseTrainer):
                         rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
                 else:
                     
-                    reward_kwargs["num_candidates"] = self.args.num_candidates #isha added
+                    reward_kwargs["num_candidates"] = self.args.num_candidates
                     output_reward_func = reward_func(
                         prompts=prompts, completions=completions, completion_ids=completion_ids_list, **reward_kwargs
                     )
@@ -1131,20 +1216,35 @@ class GRPOTrainer(BaseTrainer):
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+            # Always compute entropies during generation to reuse in _compute_loss (avoids redundant forward pass)
+            # Entropies are needed for: 1) entropy reward (if enabled), 2) entropy masking in loss computation
+            compute_entropy_always = True  # Always compute to avoid recomputing in _compute_loss
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
             ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                old_per_token_logps, old_entropies = self._get_per_token_logps_and_entropies(
                     self.model,
                     prompt_completion_ids,
                     attention_mask,
                     logits_to_keep,
                     batch_size,
+                    compute_entropy=compute_entropy_always,
                     num_images=num_images,
                     **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
                 )
             else:
                 old_per_token_logps = None
+                # Always compute entropies even if old_per_token_logps is None (needed for loss computation)
+                _, old_entropies = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    prompt_completion_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size,
+                    compute_entropy=True,
+                    num_images=num_images,
+                    **forward_kwargs,
+                )
 
             # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
             if self.use_vllm and self.vllm_importance_sampling_correction:
@@ -1193,14 +1293,63 @@ class GRPOTrainer(BaseTrainer):
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
-        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        # Pass pre-computed entropies to reward functions to avoid redundant forward passes
+        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list, precomputed_entropies=old_entropies)
         
         torch.cuda.empty_cache()
         gc.collect()
         self.accelerator.wait_for_everyone()
 
+        # Compute adaptive brier weight if brier is in reward functions and adaptive brier is enabled
+        enable_adaptive = getattr(self.args, 'enable_adaptive_brier', False)
+        if self.brier_weight_index is not None and enable_adaptive:
+            # Get current step (self.state is initialized by BaseTrainer, but add safety check)
+            try:
+                current_step = self.state.global_step if hasattr(self, 'state') and self.state is not None else 0
+            except (AttributeError, RuntimeError):
+                current_step = 0
+            
+            # Get max_steps from training arguments or state
+            max_steps = None
+            if hasattr(self.args, 'max_steps') and self.args.max_steps is not None and self.args.max_steps > 0:
+                max_steps = self.args.max_steps
+            elif hasattr(self, 'state') and self.state is not None:
+                try:
+                    if hasattr(self.state, 'max_steps') and self.state.max_steps is not None and self.state.max_steps > 0:
+                        max_steps = self.state.max_steps
+                except (AttributeError, RuntimeError):
+                    pass
+            
+            # If max_steps is still not set (e.g., using epochs), estimate from current step
+            # This is a conservative estimate that will be refined as training progresses
+            if max_steps is None:
+                max_steps = max(1000, current_step * 10)  # Conservative estimate
+            
+            # Get adaptive brier weight parameters from config
+            weight_start = getattr(self.args, 'adaptive_brier_weight_start', 0.0)
+            weight_end = getattr(self.args, 'adaptive_brier_weight_end', 0.05)
+            ramp_start_step = getattr(self.args, 'adaptive_brier_ramp_start_step', 200)
+            
+            # Compute adaptive brier weight:
+            # - weight_start for steps before ramp_start_step
+            # - linearly ramp from weight_start to weight_end from ramp_start_step to max_steps
+            if current_step <= ramp_start_step:
+                adaptive_brier_weight = weight_start
+            else:
+                # Linear ramp from ramp_start_step to max_steps
+                ramp_end_step = max_steps
+                ramp_range = max(1, ramp_end_step - ramp_start_step)  # Avoid division by zero
+                progress = min(1.0, (current_step - ramp_start_step) / ramp_range)
+                adaptive_brier_weight = weight_start + (weight_end - weight_start) * progress
+            
+            # Update reward weights with adaptive brier weight
+            reward_weights = self.original_reward_weights.clone()
+            reward_weights[self.brier_weight_index] = adaptive_brier_weight
+        else:
+            reward_weights = self.reward_weights
+
         # Apply weights to each reward function's output and sum
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        rewards = (rewards_per_func * reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1243,6 +1392,71 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["reward"].append(mean_grouped_rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_rewards.mean().item())
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
+
+        # Compute pass@1 and pass@i metrics for RLVR Multi
+        # Extract format_pattern from reward function if available
+        format_pattern = None
+        if self.reward_funcs and len(self.reward_funcs) > 0:
+            # Check if format_pattern is in args
+            if hasattr(self.args, 'format_pattern'):
+                format_pattern = self.args.format_pattern
+            else:
+                # Try to extract from reward function's keyword arguments (if it's a partial function)
+                first_reward_func = self.reward_funcs[0]
+                if isinstance(first_reward_func, partial):
+                    format_pattern = first_reward_func.keywords.get('format_pattern', None)
+        
+        # If format_pattern is a multi-answer format, compute pass@1 and pass@i metrics
+        fmt_lower = str(format_pattern).lower() if format_pattern else ""
+        if format_pattern and fmt_lower in ("multi_answer_rlvr", "multi_answer", "multi_answer_no_analysis"):
+            from reward_fns import pass_at_1, pass_at_i, num_correct_at_i
+            
+            # Prepare reward kwargs for pass_at functions (same as in _calculate_rewards)
+            keys = [key for key in inputs[0] if key not in ["prompt", "completion", "completion_ids"]]
+            reward_kwargs_for_pass = {key: [example[key] for example in inputs] for key in keys}
+            reward_kwargs_for_pass["num_candidates"] = self.args.num_candidates
+            
+            # Add more_than_one_correctness_point parameter if available
+            if hasattr(self.args, 'more_than_one_correctness_point'):
+                reward_kwargs_for_pass["more_than_one_correctness_pt"] = self.args.more_than_one_correctness_point
+            
+            # Add enforce_uniqueness parameter if available
+            if hasattr(self.args, 'enforce_uniqueness') and self.args.enforce_uniqueness is not None:
+                reward_kwargs_for_pass["enforceUniqueness"] = self.args.enforce_uniqueness
+            
+            # Add confidences_sum_to_less_than_1 parameter if available
+            if hasattr(self.args, 'confidences_sum_to_less_than_1'):
+                reward_kwargs_for_pass["confidences_sum_to_less_than_1"] = self.args.confidences_sum_to_less_than_1
+            
+            # Compute pass@1
+            pass_at_1_scores = pass_at_1(
+                format_pattern=format_pattern,
+                completions=completions,
+                **reward_kwargs_for_pass
+            )
+            pass_at_1_mean = float(np.mean(pass_at_1_scores)) if pass_at_1_scores else 0.0
+            self._metrics[mode]["pass@1"].append(pass_at_1_mean)
+            
+            # Compute pass@i where i = num_candidates
+            if self.args.num_candidates and self.args.num_candidates > 0:
+                pass_at_i_scores = pass_at_i(
+                    format_pattern=format_pattern,
+                    completions=completions,
+                    i=self.args.num_candidates,
+                    **reward_kwargs_for_pass
+                )
+                pass_at_i_mean = float(np.mean(pass_at_i_scores)) if pass_at_i_scores else 0.0
+                self._metrics[mode][f"pass@{self.args.num_candidates}"].append(pass_at_i_mean)
+                
+                # Compute num_correct (count of correct answers, same as pass@i but non-binary)
+                num_correct_scores = num_correct_at_i(
+                    format_pattern=format_pattern,
+                    completions=completions,
+                    i=self.args.num_candidates,
+                    **reward_kwargs_for_pass
+                )
+                num_correct_mean = float(np.mean(num_correct_scores)) if num_correct_scores else 0.0
+                self._metrics[mode]["num_correct"].append(num_correct_mean)
 
         # # Log prompt and completion texts
         # self._logs["prompt"].extend(gather_object(prompts_text))
@@ -1335,6 +1549,14 @@ class GRPOTrainer(BaseTrainer):
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
+        # Store precomputed entropies to avoid recomputing in _compute_loss
+        # old_entropies should always be computed now (always True), but add safety check
+        if old_entropies is not None:
+            output["precomputed_entropies"] = old_entropies
+        else:
+            # This should not happen, but if it does, log a warning
+            import warnings
+            warnings.warn("old_entropies is None - entropies will be recomputed in _compute_loss (may cause OOM)")
         if self.use_vllm and self.vllm_importance_sampling_correction:
             output["importance_sampling_ratio"] = importance_sampling_ratio
         if ref_per_token_logps is not None:
@@ -1364,14 +1586,33 @@ class GRPOTrainer(BaseTrainer):
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Compute the per_token_logps and the entropy at each position in the completion
-        per_token_logps, entropies = self._get_per_token_logps_and_entropies(
-            model,
-            input_ids,
-            attention_mask,
-            logits_to_keep,
-            compute_entropy=True
-        )
+        # Check if entropies were already computed during _generate_and_score_completions
+        # If so, reuse them to avoid redundant forward pass (saves memory)
+        if "precomputed_entropies" in inputs and inputs["precomputed_entropies"] is not None:
+            # Reuse precomputed entropies - only compute logps (saves memory!)
+            per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                compute_entropy=False
+            )
+            entropies = inputs["precomputed_entropies"]
+            # Ensure entropies are on the correct device
+            if isinstance(entropies, torch.Tensor):
+                device = next(model.parameters()).device
+                entropies = entropies.to(device)
+        else:
+            # Fallback: compute both logps and entropies (should not happen if entropies are always precomputed)
+            import warnings
+            warnings.warn("precomputed_entropies not found in inputs - recomputing (may cause OOM). This should not happen.")
+            per_token_logps, entropies = self._get_per_token_logps_and_entropies(
+                model,
+                input_ids,
+                attention_mask,
+                logits_to_keep,
+                compute_entropy=True
+            )
 
         if self.top_entropy_quantile < 1.0:
             entropy_mask = self.get_high_entropy_mask(entropies, completion_mask, 1 - self.top_entropy_quantile)
@@ -1379,8 +1620,8 @@ class GRPOTrainer(BaseTrainer):
             entropy_mask = None
 
         # Compute the KL divergence between the model and the reference model
-        if self.beta != 0.0:
-            ref_per_token_logps = inputs["ref_per_token_logps"]
+        ref_per_token_logps = inputs.get("ref_per_token_logps")
+        if ref_per_token_logps is not None:
             per_token_kl = (
                 torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
             )
@@ -1425,7 +1666,7 @@ class GRPOTrainer(BaseTrainer):
         if self.use_vllm and self.vllm_importance_sampling_correction:
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
-        if self.beta != 0.0:
+        if self.beta != 0.0 and ref_per_token_logps is not None:
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         if self.loss_type == "grpo":
@@ -1454,9 +1695,51 @@ class GRPOTrainer(BaseTrainer):
             else:
                 return (x * completion_mask).sum() / completion_token_count
 
-        if self.beta != 0.0:
+        if ref_per_token_logps is not None:
             mean_kl = masked_batch_mean(per_token_kl)
-            self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
+            gathered_kl = self.accelerator.gather(mean_kl).nanmean().item()
+            self._metrics[mode]["kl"].append(gathered_kl)
+            
+            # Adaptive beta control: adjust beta to maintain target_kl
+            # Accumulate KL across gradient accumulation batches and update beta once per step
+            if self.adaptive_beta and self.target_kl is not None and mode == "train":
+                current_step = self.state.global_step if hasattr(self, 'state') and self.state is not None else 0
+                
+                # Detect new step: update beta using accumulated KL from previous step
+                if current_step != self._last_beta_update_step:
+                    # If we have accumulated KL from previous step, use it to update beta
+                    if self._accumulated_kl_count > 0:
+                        # Compute average KL across all accumulation batches from previous step
+                        avg_kl = self._accumulated_kl_sum / self._accumulated_kl_count
+                        
+                        # Compute KL difference from target
+                        kl_diff = avg_kl - self.target_kl
+                        
+                        # Update beta using proportional control
+                        # If KL > target_kl, increase beta (more penalty)
+                        # If KL < target_kl, decrease beta (less penalty)
+                        beta_update = self.adaptive_beta_lr * kl_diff
+                        new_beta = max(1e-6, self.beta + beta_update)  # Ensure beta never becomes exactly 0.0
+                        
+                        # Synchronize beta across all processes in distributed training
+                        beta_list = [new_beta] if self.accelerator.is_main_process else [self.beta]
+                        beta_list = broadcast_object_list(beta_list)
+                        self.beta = beta_list[0]
+                        
+                        # Log beta value (only once per step, only on main process)
+                        if self.accelerator.is_main_process:
+                            if "beta" not in self._metrics[mode]:
+                                self._metrics[mode]["beta"] = []
+                            self._metrics[mode]["beta"].append(self.beta)
+                    
+                    # Reset accumulation for new step
+                    self._accumulated_kl_sum = 0.0
+                    self._accumulated_kl_count = 0
+                    self._last_beta_update_step = current_step
+                
+                # Accumulate KL for current step (will be used to update beta at start of next step)
+                self._accumulated_kl_sum += gathered_kl
+                self._accumulated_kl_count += 1
 
         mean_entropy = masked_batch_mean(entropies)
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())

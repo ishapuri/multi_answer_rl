@@ -208,8 +208,11 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
         class_outputs = None
 
     # Check if multi-answer format early
-    is_multi_rlcr  = (str(format_pattern).lower() == "multi_answer_short")
-    is_multi_rlvr  = (str(format_pattern).lower() == "multi_answer_rlvr_short")
+    is_multi_rlcr  = (str(format_pattern).lower() == "multi_answer_short" or 
+                      str(format_pattern).lower() == "multi_answer" or 
+                      str(format_pattern).lower() == "multi_answer_no_analysis")
+    is_multi_rlvr  = (str(format_pattern).lower() == "multi_answer_rlvr_short" or 
+                      str(format_pattern).lower() == "multi_answer_rlvr")
     do_multi_block = (is_multi_rlcr or is_multi_rlvr)
 
     ### CHECK CORRECTNESS ###
@@ -223,34 +226,73 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
             answer = local_dataset[i]["answer"]
         
         if do_multi_block:
-            # For multi-answer formats, only process the first completion (output_0)
-            # and track each candidate separately to match candidate_correctness structure
-            j = 0
-            pred_response = local_dataset[i][f"{config.name}-output_{j}"]
-            conf_format, conf_level = confidence_extractor(pred_response)
-            conf_format_list.append(conf_format)
-            c_len_list.append(len(pred_response))
-            conf_list.append(conf_level)
-            
-            answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
-            
-            if not answers_by_idx:
-                # No multi tags; treat as all incorrect
-                # We still need to match the structure, but with empty/zero values
-                eval_list = []
-                which_ans_list = []
+            # For multi-answer formats, process all n completions when n > 1
+            # When n == 1, keep the same structure (no wrapping)
+            if n > 1:
+                # Process all n completions, creating nested structure
+                eval_list_nested = []
+                which_ans_list_nested = []
+                for j in range(n):
+                    pred_response = local_dataset[i][f"{config.name}-output_{j}"]
+                    conf_format, conf_level = confidence_extractor(pred_response)
+                    conf_format_list.append(conf_format)
+                    c_len_list.append(len(pred_response))
+                    conf_list.append(conf_level)
+                    
+                    answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
+                    
+                    if not answers_by_idx:
+                        # No multi tags; treat as all incorrect
+                        eval_list_nested.append([])
+                        which_ans_list_nested.append([])
+                    else:
+                        # Build ordered candidate list
+                        max_i = max(answers_by_idx.keys())
+                        candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+                        
+                        # Check correctness and get matched indices for each candidate
+                        ys, matched_indices = _candidate_correct_labels_with_indices(candidates, answer)
+                        
+                        # Track each candidate separately for this completion
+                        completion_evals = []
+                        completion_which_ans = []
+                        for y, midx in zip(ys, matched_indices):
+                            completion_evals.append(1 if y == 1.0 else 0)
+                            completion_which_ans.append(midx)
+                        eval_list_nested.append(completion_evals)
+                        which_ans_list_nested.append(completion_which_ans)
+                
+                # For n > 1, wrap in nested structure
+                eval_list = eval_list_nested
+                which_ans_list = which_ans_list_nested
             else:
-                # Build ordered candidate list
-                max_i = max(answers_by_idx.keys())
-                candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+                # n == 1: keep the same structure as before (no wrapping)
+                j = 0
+                pred_response = local_dataset[i][f"{config.name}-output_{j}"]
+                conf_format, conf_level = confidence_extractor(pred_response)
+                conf_format_list.append(conf_format)
+                c_len_list.append(len(pred_response))
+                conf_list.append(conf_level)
                 
-                # Check correctness and get matched indices for each candidate
-                ys, matched_indices = _candidate_correct_labels_with_indices(candidates, answer)
+                answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
                 
-                # Track each candidate separately (matching candidate_correctness structure)
-                for y, midx in zip(ys, matched_indices):
-                    eval_list.append(1 if y == 1.0 else 0)
-                    which_ans_list.append(midx)
+                if not answers_by_idx:
+                    # No multi tags; treat as all incorrect
+                    # We still need to match the structure, but with empty/zero values
+                    eval_list = []
+                    which_ans_list = []
+                else:
+                    # Build ordered candidate list
+                    max_i = max(answers_by_idx.keys())
+                    candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+                    
+                    # Check correctness and get matched indices for each candidate
+                    ys, matched_indices = _candidate_correct_labels_with_indices(candidates, answer)
+                    
+                    # Track each candidate separately (matching candidate_correctness structure)
+                    for y, midx in zip(ys, matched_indices):
+                        eval_list.append(1 if y == 1.0 else 0)
+                        which_ans_list.append(midx)
         else:
             # For single-answer formats, process all n completions
             for j in range(n):
@@ -260,19 +302,6 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
                 c_len_list.append(len(pred_response))
                 conf_list.append(conf_level)
                 
-                # For single-answer formats, use the existing logic
-                pred = [{"role": "assistant", "content": pred_response}]
-                args = {"completions": [pred], "answer": [answer]}
-                actual_correctness, matched_idx = correctness_fn(**args)
-                actual_correctness = actual_correctness[0]
-                matched_idx = matched_idx[0]
-                
-                if actual_correctness == 1:
-                    eval_list.append(1)
-                else:
-                    eval_list.append(0)
-                which_ans_list.append(matched_idx)
-            else:
                 # For single-answer formats, use the existing logic
                 pred = [{"role": "assistant", "content": pred_response}]
                 args = {"completions": [pred], "answer": [answer]}
@@ -302,10 +331,9 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
     multi_candidate_correctness = []  # Store correctness for each candidate answer
 
     if do_multi_block:
-        # We compute per-example from the FIRST completion (index 0) of each item.
-        # (This mirrors typical n=1 inference; keeps changes minimal and deterministic.)
+        # Process all n completions when n > 1, or just the first when n == 1
+        # For metrics, we still use only the first completion (output_0) to maintain consistency
         for i in range(len(local_dataset)):
-            pred_response = local_dataset[i][f"{config.name}-output_0"]
             # Support both "answer" and "answers" columns
             if "answers" in local_dataset[i]:
                 gt_list = local_dataset[i]["answers"]
@@ -314,13 +342,58 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
             # Pass full gt_list to support multiple ground truth answers for ambiguous datasets
             gt = gt_list
 
+            if n > 1:
+                # Process all n completions for candidate_correctness
+                example_candidate_correctness = []
+                for j in range(n):
+                    pred_response = local_dataset[i][f"{config.name}-output_{j}"]
+                    answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
+
+                    if not answers_by_idx:
+                        # No multi tags; treat as all incorrect / zero-confs
+                        example_candidate_correctness.append([])
+                    else:
+                        # Build ordered candidate list
+                        max_i = max(answers_by_idx.keys())
+                        # answers in numbered order (1..K)
+                        candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+
+                        # Labels - _candidate_correct_labels handles both single and multiple ground truth answers
+                        ys = _candidate_correct_labels(candidates, gt)
+                        
+                        # Store correctness labels for each candidate (in original order 1..K)
+                        example_candidate_correctness.append([float(y) for y in ys])
+                
+                multi_candidate_correctness.append(example_candidate_correctness)
+            else:
+                # n == 1: keep the same structure as before
+                pred_response = local_dataset[i][f"{config.name}-output_0"]
+                answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
+
+                if not answers_by_idx:
+                    # No multi tags; treat as all incorrect / zero-confs
+                    multi_candidate_correctness.append([])  # Empty list for no candidates
+                else:
+                    # Build ordered candidate list
+                    max_i = max(answers_by_idx.keys())
+                    # answers in numbered order (1..K)
+                    candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+
+                    # Labels - _candidate_correct_labels handles both single and multiple ground truth answers
+                    ys = _candidate_correct_labels(candidates, gt)
+                    
+                    # Store correctness labels for each candidate (in original order 1..K)
+                    multi_candidate_correctness.append([float(y) for y in ys])
+
+            # For metrics computation, we still use only the first completion (output_0)
+            # This maintains consistency with existing metrics
+            pred_response = local_dataset[i][f"{config.name}-output_0"]
             answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
 
             if not answers_by_idx:
                 # No multi tags; treat as all incorrect / zero-confs
                 multi_pass_at_1.append(0.0); multi_pass_at_2.append(0.0); multi_pass_at_3.append(0.0)
                 if is_multi_rlcr: per_example_set_brier.append(0.0)
-                multi_candidate_correctness.append([])  # Empty list for no candidates
                 continue
 
             # Build ordered candidate list
@@ -330,9 +403,6 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
 
             # Labels - _candidate_correct_labels handles both single and multiple ground truth answers
             ys = _candidate_correct_labels(candidates, gt)
-            
-            # Store correctness labels for each candidate (in original order 1..K)
-            multi_candidate_correctness.append([float(y) for y in ys])
 
             # Ordering: RLCR rank by confidence desc; RLVR keep numeric order
             order = list(range(len(candidates)))
@@ -414,21 +484,42 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
         for i in range(len(evals)):
             eval_list = evals[i]
             conf_list = confidence_levels[i] if i < len(confidence_levels) else []
-            num_candidates = len(eval_list)
             
-            # Add correctness values
-            correctness_list.extend(eval_list)
-            
-            # Expand confidence to match number of candidates
-            # Only add confidence if we have candidates (to keep lengths matching)
-            if num_candidates > 0:
-                if len(conf_list) > 0:
-                    # Repeat the confidence for each candidate
-                    expanded_conf_levels.extend([conf_list[0]] * num_candidates)
-                else:
-                    # No confidence available, use 0.0 for each candidate
-                    expanded_conf_levels.extend([0.0] * num_candidates)
-            # If num_candidates == 0, we skip adding confidence (to match correctness)
+            # Handle nested structure when n > 1
+            if n > 1 and isinstance(eval_list, list) and len(eval_list) > 0 and isinstance(eval_list[0], list):
+                # eval_list is a list of lists (one per completion)
+                # Flatten across all completions
+                for j, completion_evals in enumerate(eval_list):
+                    num_candidates = len(completion_evals)
+                    # Add correctness values for this completion
+                    correctness_list.extend(completion_evals)
+                    
+                    # Expand confidence to match number of candidates
+                    # Use the confidence for this completion (conf_list[j])
+                    if num_candidates > 0:
+                        if j < len(conf_list) and len(conf_list) > 0:
+                            # Repeat the confidence for each candidate in this completion
+                            expanded_conf_levels.extend([conf_list[j]] * num_candidates)
+                        else:
+                            # No confidence available, use 0.0 for each candidate
+                            expanded_conf_levels.extend([0.0] * num_candidates)
+            else:
+                # n == 1: eval_list is a flat list of candidates
+                num_candidates = len(eval_list)
+                
+                # Add correctness values
+                correctness_list.extend(eval_list)
+                
+                # Expand confidence to match number of candidates
+                # Only add confidence if we have candidates (to keep lengths matching)
+                if num_candidates > 0:
+                    if len(conf_list) > 0:
+                        # Repeat the confidence for each candidate
+                        expanded_conf_levels.extend([conf_list[0]] * num_candidates)
+                    else:
+                        # No confidence available, use 0.0 for each candidate
+                        expanded_conf_levels.extend([0.0] * num_candidates)
+                # If num_candidates == 0, we skip adding confidence (to match correctness)
         
         # Ensure arrays have the same length before creating numpy arrays
         min_len = min(len(correctness_list), len(expanded_conf_levels))
@@ -443,8 +534,36 @@ def confidence_verifier(local_dataset, config, format_fn="confidence_format", fo
         # Final safety check
         assert len(correctness_array) == len(confidence_array), f"Array length mismatch: correctness={len(correctness_array)}, confidence={len(confidence_array)}"
     else:
+        # For single-answer formats, ensure confidence_levels matches evals structure
+        # Expand confidence to match number of evaluations per example
+        expanded_conf_levels = []
+        for i in range(len(evals)):
+            eval_list = evals[i]
+            conf_list = confidence_levels[i] if i < len(confidence_levels) else []
+            num_evals = len(eval_list)
+            
+            # Expand confidence to match number of evaluations
+            if num_evals > 0:
+                if len(conf_list) > 0:
+                    # If we have multiple confidences, use them; otherwise repeat the first one
+                    if len(conf_list) >= num_evals:
+                        expanded_conf_levels.extend(conf_list[:num_evals])
+                    else:
+                        # Repeat the last confidence value to match num_evals
+                        expanded_conf_levels.extend(conf_list + [conf_list[-1] if conf_list else 0.0] * (num_evals - len(conf_list)))
+                else:
+                    # No confidence available, use 0.0 for each evaluation
+                    expanded_conf_levels.extend([0.0] * num_evals)
+        
         correctness_array = np.array(evals).flatten()
-        confidence_array = np.array(confidence_levels).flatten()
+        confidence_array = np.array(expanded_conf_levels) if len(expanded_conf_levels) > 0 else np.array([], dtype=float)
+        
+        # Final safety check
+        if len(correctness_array) != len(confidence_array):
+            min_len = min(len(correctness_array), len(confidence_array))
+            print(f"Warning: Mismatch in array lengths: correctness={len(correctness_array)}, confidence={len(confidence_array)}. Truncating to {min_len}.")
+            correctness_array = correctness_array[:min_len]
+            confidence_array = confidence_array[:min_len]
     if not do_multi_block: 
         metrics["brier_score"] = get_brier(correctness_array, confidence_array) 
     metrics["ece"] = get_ece(correctness_array, confidence_array)
@@ -488,8 +607,11 @@ def llm_confidence_verifier(
     n = config.n
 
     # --- Multi-answer flags (mirror confidence_verifier) ---
-    is_multi_rlcr  = (str(format_pattern).lower() == "multi_answer_short")
-    is_multi_rlvr  = (str(format_pattern).lower() == "multi_answer_rlvr_short")
+    is_multi_rlcr  = (str(format_pattern).lower() == "multi_answer_short" or 
+                      str(format_pattern).lower() == "multi_answer" or 
+                      str(format_pattern).lower() == "multi_answer_no_analysis")
+    is_multi_rlvr  = (str(format_pattern).lower() == "multi_answer_rlvr_short" or 
+                      str(format_pattern).lower() == "multi_answer_rlvr")
     do_multi_block = (is_multi_rlcr or is_multi_rlvr)
 
     if f"{config.name}-class_output" in local_dataset.column_names:
@@ -590,33 +712,72 @@ def llm_confidence_verifier(
             gold_list = [gt_answers]
         
         if do_multi_block:
-            # For multi-answer formats, only process the first completion (output_0)
-            # and track each candidate separately to match candidate_correctness structure
-            j = 0
-            pred_response = local_dataset[i][f"{config.name}-output_{j}"]
-            conf_format, conf_level = confidence_extractor(pred_response)
-            conf_format_list.append(conf_format)
-            c_len_list.append(len(pred_response))
-            conf_list.append(conf_level)
-            
-            answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
-            
-            if not answers_by_idx:
-                # No multi tags; treat as all incorrect
-                eval_list = []
-                which_ans_list = []
+            # For multi-answer formats, process all n completions when n > 1
+            # When n == 1, keep the same structure (no wrapping)
+            if n > 1:
+                # Process all n completions, creating nested structure
+                eval_list_nested = []
+                which_ans_list_nested = []
+                for j in range(n):
+                    pred_response = local_dataset[i][f"{config.name}-output_{j}"]
+                    conf_format, conf_level = confidence_extractor(pred_response)
+                    conf_format_list.append(conf_format)
+                    c_len_list.append(len(pred_response))
+                    conf_list.append(conf_level)
+                    
+                    answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
+                    
+                    if not answers_by_idx:
+                        # No multi tags; treat as all incorrect
+                        eval_list_nested.append([])
+                        which_ans_list_nested.append([])
+                    else:
+                        # Build ordered candidate list
+                        max_i = max(answers_by_idx.keys())
+                        candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+                        
+                        # Check correctness and get matched indices for each candidate
+                        ys, matched_indices = _candidate_correct_labels_with_indices(candidates, gt_answers)
+                        
+                        # Track each candidate separately for this completion
+                        completion_evals = []
+                        completion_which_ans = []
+                        for y, midx in zip(ys, matched_indices):
+                            completion_evals.append(1 if y == 1.0 else 0)
+                            completion_which_ans.append(midx)
+                        eval_list_nested.append(completion_evals)
+                        which_ans_list_nested.append(completion_which_ans)
+                
+                # For n > 1, wrap in nested structure
+                eval_list = eval_list_nested
+                which_ans_list = which_ans_list_nested
             else:
-                # Build ordered candidate list
-                max_i = max(answers_by_idx.keys())
-                candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+                # n == 1: keep the same structure as before (no wrapping)
+                j = 0
+                pred_response = local_dataset[i][f"{config.name}-output_{j}"]
+                conf_format, conf_level = confidence_extractor(pred_response)
+                conf_format_list.append(conf_format)
+                c_len_list.append(len(pred_response))
+                conf_list.append(conf_level)
                 
-                # Check correctness and get matched indices for each candidate
-                ys, matched_indices = _candidate_correct_labels_with_indices(candidates, gt_answers)
+                answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
                 
-                # Track each candidate separately (matching candidate_correctness structure)
-                for y, midx in zip(ys, matched_indices):
-                    eval_list.append(1 if y == 1.0 else 0)
-                    which_ans_list.append(midx)
+                if not answers_by_idx:
+                    # No multi tags; treat as all incorrect
+                    eval_list = []
+                    which_ans_list = []
+                else:
+                    # Build ordered candidate list
+                    max_i = max(answers_by_idx.keys())
+                    candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+                    
+                    # Check correctness and get matched indices for each candidate
+                    ys, matched_indices = _candidate_correct_labels_with_indices(candidates, gt_answers)
+                    
+                    # Track each candidate separately (matching candidate_correctness structure)
+                    for y, midx in zip(ys, matched_indices):
+                        eval_list.append(1 if y == 1.0 else 0)
+                        which_ans_list.append(midx)
         else:
             # For single-answer formats, process all n completions
             for j in range(n):
@@ -661,10 +822,9 @@ def llm_confidence_verifier(
     multi_candidate_correctness = []  # Store correctness for each candidate
 
     if do_multi_block:
-        # For each example, we look only at the FIRST completion (output_0),
-        # parse its multi answers, and judge each candidate via the LLM.
+        # Process all n completions when n > 1, or just the first when n == 1
+        # For metrics, we still use only the first completion (output_0) to maintain consistency
         for i in range(len(local_dataset)):
-            pred_response = local_dataset[i][f"{config.name}-output_0"]
             # Support both "answer" and "answers" columns
             if "answers" in local_dataset[i]:
                 gt_list = local_dataset[i]["answers"]
@@ -673,6 +833,92 @@ def llm_confidence_verifier(
             question = local_dataset[i][chosen_key]
             gt = gt_list  # allow list; prompt text handles multiple GTs
 
+            if n > 1:
+                # Process all n completions for candidate_correctness
+                example_candidate_correctness = []
+                for j in range(n):
+                    pred_response = local_dataset[i][f"{config.name}-output_{j}"]
+                    answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
+
+                    if not answers_by_idx:
+                        # No multi tags; treat as all incorrect / zero-confs
+                        example_candidate_correctness.append([])
+                    else:
+                        # Build ordered candidate list 1..K
+                        max_i = max(answers_by_idx.keys())
+                        candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+
+                        # Build prompts for each candidate answer for this completion
+                        cand_prompts = []
+                        for cand in candidates:
+                            prompt = f"""
+                            Question: {question}
+                            Ground Truth Answers: {gt}
+                            Model Generated Answer: {cand}
+                            """
+                            processed_prompt = [
+                                {"role": "system", "content": sys_prompt},
+                                {"role": "user", "content": prompt},
+                            ]
+                            tokenized_prompt = tokenizer.apply_chat_template(
+                                processed_prompt, truncation=False, add_generation_prompt=True
+                            )
+                            decoded_prompt = tokenizer.decode(tokenized_prompt)
+                            cand_prompts.append(decoded_prompt)
+
+                        # Judge all candidates for this completion in a small batch
+                        cand_outputs = llm.generate(cand_prompts, sampling_params=sampling_params)
+                        ys = []
+                        for out in cand_outputs:
+                            text_r = out.outputs[0].text
+                            ys.append(1.0 if "yes" in text_r.lower() else 0.0)
+                        
+                        example_candidate_correctness.append(ys)
+                
+                multi_candidate_correctness.append(example_candidate_correctness)
+            else:
+                # n == 1: keep the same structure as before
+                pred_response = local_dataset[i][f"{config.name}-output_0"]
+                answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
+
+                if not answers_by_idx:
+                    # No multi tags; treat as all incorrect / zero-confs
+                    multi_candidate_correctness.append([])
+                else:
+                    # Build ordered candidate list 1..K
+                    max_i = max(answers_by_idx.keys())
+                    candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
+
+                    # Build prompts for each candidate answer for this example
+                    cand_prompts = []
+                    for cand in candidates:
+                        prompt = f"""
+                        Question: {question}
+                        Ground Truth Answers: {gt}
+                        Model Generated Answer: {cand}
+                        """
+                        processed_prompt = [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": prompt},
+                        ]
+                        tokenized_prompt = tokenizer.apply_chat_template(
+                            processed_prompt, truncation=False, add_generation_prompt=True
+                        )
+                        decoded_prompt = tokenizer.decode(tokenized_prompt)
+                        cand_prompts.append(decoded_prompt)
+
+                    # Judge all candidates for this example in a small batch
+                    cand_outputs = llm.generate(cand_prompts, sampling_params=sampling_params)
+                    ys = []
+                    for out in cand_outputs:
+                        text_r = out.outputs[0].text
+                        ys.append(1.0 if "yes" in text_r.lower() else 0.0)
+
+                    multi_candidate_correctness.append(ys)
+
+            # For metrics computation, we still use only the first completion (output_0)
+            # This maintains consistency with existing metrics
+            pred_response = local_dataset[i][f"{config.name}-output_0"]
             answers_by_idx, confs_by_idx = _extract_multi_answers_and_confidences(pred_response)
 
             if not answers_by_idx:
@@ -682,39 +928,44 @@ def llm_confidence_verifier(
                 multi_pass_at_3.append(0.0)
                 if is_multi_rlcr:
                     per_example_set_brier.append(0.0)
-                multi_candidate_correctness.append([])
                 continue
 
             # Build ordered candidate list 1..K
             max_i = max(answers_by_idx.keys())
             candidates = [answers_by_idx.get(k, "").strip() for k in range(1, max_i + 1)]
 
-            # Build prompts for each candidate answer for this example
-            cand_prompts = []
-            for cand in candidates:
-                prompt = f"""
-                Question: {question}
-                Ground Truth Answers: {gt}
-                Model Generated Answer: {cand}
-                """
-                processed_prompt = [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": prompt},
-                ]
-                tokenized_prompt = tokenizer.apply_chat_template(
-                    processed_prompt, truncation=False, add_generation_prompt=True
-                )
-                decoded_prompt = tokenizer.decode(tokenized_prompt)
-                cand_prompts.append(decoded_prompt)
+            # For metrics, use the first completion's candidate correctness
+            # Reuse already-computed values to avoid redundant LLM calls
+            if n > 1 and len(multi_candidate_correctness[i]) > 0:
+                ys = multi_candidate_correctness[i][0]  # Use first completion for metrics
+            elif n == 1 and len(multi_candidate_correctness[i]) > 0:
+                ys = multi_candidate_correctness[i]  # Use directly when n == 1
+            else:
+                # Fallback: should not happen, but compute if needed
+                # Build prompts for each candidate answer for this example (for metrics)
+                cand_prompts = []
+                for cand in candidates:
+                    prompt = f"""
+                    Question: {question}
+                    Ground Truth Answers: {gt}
+                    Model Generated Answer: {cand}
+                    """
+                    processed_prompt = [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": prompt},
+                    ]
+                    tokenized_prompt = tokenizer.apply_chat_template(
+                        processed_prompt, truncation=False, add_generation_prompt=True
+                    )
+                    decoded_prompt = tokenizer.decode(tokenized_prompt)
+                    cand_prompts.append(decoded_prompt)
 
-            # Judge all candidates for this example in a small batch
-            cand_outputs = llm.generate(cand_prompts, sampling_params=sampling_params)
-            ys = []
-            for out in cand_outputs:
-                text_r = out.outputs[0].text
-                ys.append(1.0 if "yes" in text_r.lower() else 0.0)
-
-            multi_candidate_correctness.append(ys)
+                # Judge all candidates for this example in a small batch
+                cand_outputs = llm.generate(cand_prompts, sampling_params=sampling_params)
+                ys = []
+                for out in cand_outputs:
+                    text_r = out.outputs[0].text
+                    ys.append(1.0 if "yes" in text_r.lower() else 0.0)
 
             # Ordering: RLCR rank by confidence desc; RLVR keep numeric order
             order = list(range(len(candidates)))
@@ -781,21 +1032,42 @@ def llm_confidence_verifier(
         for i in range(len(evals)):
             eval_list = evals[i]
             conf_list = confidence_levels[i] if i < len(confidence_levels) else []
-            num_candidates = len(eval_list)
             
-            # Add correctness values
-            correctness_list.extend(eval_list)
-            
-            # Expand confidence to match number of candidates
-            # Only add confidence if we have candidates (to keep lengths matching)
-            if num_candidates > 0:
-                if len(conf_list) > 0:
-                    # Repeat the confidence for each candidate
-                    expanded_conf_levels.extend([conf_list[0]] * num_candidates)
-                else:
-                    # No confidence available, use 0.0 for each candidate
-                    expanded_conf_levels.extend([0.0] * num_candidates)
-            # If num_candidates == 0, we skip adding confidence (to match correctness)
+            # Handle nested structure when n > 1
+            if n > 1 and isinstance(eval_list, list) and len(eval_list) > 0 and isinstance(eval_list[0], list):
+                # eval_list is a list of lists (one per completion)
+                # Flatten across all completions
+                for j, completion_evals in enumerate(eval_list):
+                    num_candidates = len(completion_evals)
+                    # Add correctness values for this completion
+                    correctness_list.extend(completion_evals)
+                    
+                    # Expand confidence to match number of candidates
+                    # Use the confidence for this completion (conf_list[j])
+                    if num_candidates > 0:
+                        if j < len(conf_list) and len(conf_list) > 0:
+                            # Repeat the confidence for each candidate in this completion
+                            expanded_conf_levels.extend([conf_list[j]] * num_candidates)
+                        else:
+                            # No confidence available, use 0.0 for each candidate
+                            expanded_conf_levels.extend([0.0] * num_candidates)
+            else:
+                # n == 1: eval_list is a flat list of candidates
+                num_candidates = len(eval_list)
+                
+                # Add correctness values
+                correctness_list.extend(eval_list)
+                
+                # Expand confidence to match number of candidates
+                # Only add confidence if we have candidates (to keep lengths matching)
+                if num_candidates > 0:
+                    if len(conf_list) > 0:
+                        # Repeat the confidence for each candidate
+                        expanded_conf_levels.extend([conf_list[0]] * num_candidates)
+                    else:
+                        # No confidence available, use 0.0 for each candidate
+                        expanded_conf_levels.extend([0.0] * num_candidates)
+                # If num_candidates == 0, we skip adding confidence (to match correctness)
         
         # Ensure arrays have the same length before creating numpy arrays
         min_len = min(len(correctness_list), len(expanded_conf_levels))
@@ -810,8 +1082,36 @@ def llm_confidence_verifier(
         # Final safety check
         assert len(correctness_array) == len(confidence_array), f"Array length mismatch: correctness={len(correctness_array)}, confidence={len(confidence_array)}"
     else:
+        # For single-answer formats, ensure confidence_levels matches evals structure
+        # Expand confidence to match number of evaluations per example
+        expanded_conf_levels = []
+        for i in range(len(evals)):
+            eval_list = evals[i]
+            conf_list = confidence_levels[i] if i < len(confidence_levels) else []
+            num_evals = len(eval_list)
+            
+            # Expand confidence to match number of evaluations
+            if num_evals > 0:
+                if len(conf_list) > 0:
+                    # If we have multiple confidences, use them; otherwise repeat the first one
+                    if len(conf_list) >= num_evals:
+                        expanded_conf_levels.extend(conf_list[:num_evals])
+                    else:
+                        # Repeat the last confidence value to match num_evals
+                        expanded_conf_levels.extend(conf_list + [conf_list[-1] if conf_list else 0.0] * (num_evals - len(conf_list)))
+                else:
+                    # No confidence available, use 0.0 for each evaluation
+                    expanded_conf_levels.extend([0.0] * num_evals)
+        
         correctness_array = np.array(evals).flatten()
-        confidence_array = np.array(confidence_levels).flatten()
+        confidence_array = np.array(expanded_conf_levels) if len(expanded_conf_levels) > 0 else np.array([], dtype=float)
+        
+        # Final safety check
+        if len(correctness_array) != len(confidence_array):
+            min_len = min(len(correctness_array), len(confidence_array))
+            print(f"Warning: Mismatch in array lengths: correctness={len(correctness_array)}, confidence={len(confidence_array)}. Truncating to {min_len}.")
+            correctness_array = correctness_array[:min_len]
+            confidence_array = confidence_array[:min_len]
 
     # Only compute standard brier_score when NOT multi-answer
     if not do_multi_block:
